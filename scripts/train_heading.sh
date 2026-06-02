@@ -2,8 +2,9 @@
 env="SingleControl"
 scenario="1/heading"
 algo="ppo"
-exp="v1"
+exp="demo2_heading"
 seed=1
+export WANDB_MODE="offline"
 
 echo "env is ${env}, scenario is ${scenario}, algo is ${algo}, exp is ${exp}, seed is ${seed}"
 CUDA_VISIBLE_DEVICES=0 python train/train_jsbsim.py \
@@ -12,4 +13,5 @@ CUDA_VISIBLE_DEVICES=0 python train/train_jsbsim.py \
     --log-interval 1 --save-interval 1 \
     --num-mini-batch 5 --buffer-size 3000 --num-env-steps 1e8 \
     --lr 3e-4 --gamma 0.99 --ppo-epoch 4 --clip-params 0.2 --max-grad-norm 2 --entropy-coef 1e-3 \
-    --hidden-size "128 128" --act-hidden-size "128 128" --recurrent-hidden-size 128 --recurrent-hidden-layers 1 --data-chunk-length 8
+    --hidden-size "128 128" --act-hidden-size "128 128" --recurrent-hidden-size 128 --recurrent-hidden-layers 1 --data-chunk-length 8 \
+    --user-name "sf" --use-wandb --wandb-name "aircraft"

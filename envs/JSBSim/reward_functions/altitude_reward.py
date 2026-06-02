@@ -32,9 +32,9 @@ class AltitudeReward(BaseRewardFunction):
         ego_vz = env.agents[agent_id].get_velocity()[-1] / 340    # unit: mh
         Pv = 0.
         if ego_z <= self.safe_altitude:
-            Pv = -np.clip(ego_vz / self.Kv * (self.safe_altitude - ego_z) / self.safe_altitude, 0., 1.)
+            Pv = -np.clip(-ego_vz / self.Kv * (self.safe_altitude - ego_z) / self.safe_altitude, 0., 1.)
         PH = 0.
         if ego_z <= self.danger_altitude:
-            PH = np.clip(ego_z / self.danger_altitude, 0., 1.) - 1. - 1.
+            PH = np.clip(ego_z / self.danger_altitude, 0., 1.) - 1.
         new_reward = Pv + PH
         return self._process(new_reward, agent_id, (Pv, PH))

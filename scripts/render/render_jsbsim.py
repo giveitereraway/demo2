@@ -44,6 +44,8 @@ def parse_args(args, parser):
                        help="number of fighters controlled by RL policy")
     group.add_argument('--num-agents', type=int, default=1,
                        help="number of fighters controlled by RL policy")
+    group.add_argument('--render-mode', type=str, default='txt',
+                       help="txt or real_time")
     all_args = parser.parse_known_args(args)[0]
     return all_args
 
@@ -94,6 +96,7 @@ def main(args):
         "num_agents": num_agents,
         "device": device,
         "run_dir": run_dir,
+        "render_mode": all_args.render_mode,
     }
 
     # run experiments

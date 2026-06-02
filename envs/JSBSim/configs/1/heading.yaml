@@ -2,11 +2,11 @@
 task: heading
 
 # simulation config
-sim_freq: 100
-agent_interaction_steps: 1 # step 0.01s
+sim_freq: 60
+agent_interaction_steps: 12 # step 0.01s
 
 # termination config 终止条件
-max_steps: 20000             # episode length: 200s
+max_steps: 1000             # episode length: 200s
 altitude_limit: 2500
 acceleration_limit_x: 10.0
 acceleration_limit_y: 10.0

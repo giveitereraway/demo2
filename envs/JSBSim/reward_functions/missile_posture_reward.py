@@ -32,13 +32,15 @@ class MissilePostureReward(BaseRewardFunction):
             missile_v = missile_sim.get_velocity()
             aircraft_v = env.agents[agent_id].get_velocity()
             if self.previous_missile_v is None:
-                self.previous_missile_v = missile_v
+                self.previous_missile_v = missile_v.copy()
             v_decrease = (np.linalg.norm(self.previous_missile_v) - np.linalg.norm(missile_v)) / 340 * self.reward_scale
             angle = np.dot(missile_v, aircraft_v) / (np.linalg.norm(missile_v) * np.linalg.norm(aircraft_v))
             if angle < 0:
                 reward = angle / (max(v_decrease, 0) + 1)
             else:
                 reward = angle * max(v_decrease, 0)
+            # 保存当前速度副本，避免引用导弹内部速度数组导致下一步衰减量失真。
+            self.previous_missile_v = missile_v.copy()
         else:
             self.previous_missile_v = None
             reward = 0
