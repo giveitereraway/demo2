@@ -32,12 +32,12 @@ render = True
 ego_policy_index = 1040
 enm_policy_index = 0
 episode_rewards = 0
-ego_run_dir = "E:/clone/demo1/scripts/results/SingleCombat/1v1/NoWeapon/Selfplay/ppo/1v1_follow/wandb/offline-run-20260512_175151-yryla8wg/files"
-enm_run_dir = "E:/clone/demo1/scripts/results/SingleCombat/1v1/NoWeapon/Selfplay/ppo/1v1_follow/wandb/offline-run-20260512_175151-yryla8wg/files"
+ego_run_dir = "E:/clone/demo2/scripts/results/SingleCombat/1v1/NoWeapon/TacticalHierarchySelfplay/ppo/1v1_follow_tactical_demo2/wandb/offline-run-20260602_155345-wfdbhlmv/files"
+enm_run_dir = "E:/clone/demo1/scripts/results/SingleCombat/1v1/NoWeapon/TacticalHierarchySelfplay/ppo/1v1_tactical_hierarchy_2/wandb/offline-run-20260516_131027-v6k42xjz/files"
 #experiment_name = ego_run_dir.split('/')[-4] # ego_run_dir路径中的倒数第4个目录
 experiment_name = "selfplay"
 
-env = SingleCombatEnv("1v1/NoWeapon/Selfplay")
+env = SingleCombatEnv("1v1/NoWeapon/TacticalHierarchySelfplay")
 env.seed(0)
 args = Args()
 

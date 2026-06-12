@@ -1,4 +1,5 @@
 #!/bin/sh
+
 env="SingleCombat"
 scenario="1v1/NoWeapon/TacticalHierarchySelfplay"
 algo="ppo"

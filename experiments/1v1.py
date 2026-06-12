@@ -71,22 +71,22 @@ except Exception as exc:
 # 可修改实验配置
 # =========================
 
-EXPERIMENT_NAME = "tacticalshoot_2A_vs_shootselfB"
+EXPERIMENT_NAME = "tactical_shoot_demo2_A_vs_tactical_shoot_2_B"
 
 # 评估环境必须使用直接控制版 SingleCombat 场景。
 EVAL_SCENARIO_NAME = "1v1/ShootMissile/Selfplay"
 
 # 两个 actor 可以来自不同训练场景；脚本会按各自场景构造网络动作空间。
-ACTOR_A_PATH = REPO_ROOT / "scripts/results/SingleCombat/1v1/ShootMissile/TacticalHierarchySelfplay/ppo/1v1_tactical_hierarchy_shoot_2/wandb/offline-run-20260520_143521-lk4tkygw/files/actor_latest.pt"
+ACTOR_A_PATH = REPO_ROOT / "scripts/results/SingleCombat/1v1/ShootMissile/TacticalHierarchySelfplay/ppo/1v1_tactical_shoot_demo2/wandb/offline-run-20260608_134203-y0looxx1/files/actor_latest.pt"
 ACTOR_A_SCENARIO_NAME = "1v1/ShootMissile/TacticalHierarchySelfplay"
 
-ACTOR_B_PATH = REPO_ROOT / "scripts/results/SingleCombat/1v1/ShootMissile/Selfplay/ppo/1v1_shoot_selfplay/wandb/offline-run-20260514_140253-yxrmu45m/files/actor_latest.pt"
-ACTOR_B_SCENARIO_NAME = "1v1/ShootMissile/Selfplay"
+ACTOR_B_PATH = "E:/clone/demo1/scripts/results/SingleCombat/1v1/ShootMissile/TacticalHierarchySelfplay/ppo/1v1_tactical_hierarchy_shoot_2/wandb/offline-run-20260520_143521-lk4tkygw/files/actor_latest.pt"
+ACTOR_B_SCENARIO_NAME = "1v1/ShootMissile/TacticalHierarchySelfplay"
 
 # 分层 actor 的低层控制器。
 LOWLEVEL_ACTOR_PATH = REPO_ROOT / "envs/JSBSim/model/actor_heading.pt"
 
-NUM_EPISODES = 500
+NUM_EPISODES = 50
 SEED = 1
 DEVICE = "cuda:0"  # auto / cpu / cuda:0
 DETERMINISTIC = True
@@ -119,7 +119,7 @@ RANDOM_INITIAL_STATE_CONFIG = {
     "altitude_difference_ft": [-3000.0, 3000.0], # 两机高度差
     "speed_fps": [650.0, 950.0], # 双方初始速度范围
     # mixed 会在迎头、同向追逐、交叉、随机航向中随机选一种。
-    "heading_mode": "mixed",  # mixed / head_on / tail_chase / crossing / random
+    "heading_mode": "head_on",  # mixed / head_on / tail_chase / crossing / random
     "heading_noise_deg": 20.0, # 航向扰动角度
 }
 
