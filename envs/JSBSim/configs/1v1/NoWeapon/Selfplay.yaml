@@ -40,6 +40,9 @@ aircraft_configs: {
 # (lontitude, latitude, altitude)
 battle_field_center: [120.0, 60.0, 0.0]
 
+# 评估时启用航炮伤害，使占据有效射击窗口的一方能够击落对手并产生明确胜负
+use_artillery: true
+
 # reward config
 PostureReward_scale: 100.0
 PostureReward_potential: true

@@ -14,7 +14,8 @@ from envs.JSBSim.envs.singlecombat_env import SingleCombatEnv
 from envs.JSBSim.envs.multiplecombat_env import MultipleCombatEnv
 from envs.JSBSim.core.simulatior import MissileSimulator
 from envs.JSBSim.reward_functions.event_driven_reward import EventDrivenReward
-from envs.JSBSim.tasks.singlecombat_task import TacticalHierarchicalSingleCombatTask
+from envs.JSBSim.tasks.singlecombat_task import SingleCombatTask, TacticalHierarchicalSingleCombatTask
+from envs.JSBSim.utils.utils import parse_config
 from envs.env_wrappers import DummyVecEnv, SubprocVecEnv, ShareDummyVecEnv, ShareSubprocVecEnv
 
 
@@ -95,6 +96,12 @@ class TestSingleControlEnv:
 
 
 class TestSingleCombatEnv:
+
+    def test_no_weapon_selfplay_enables_artillery(self):
+        config = parse_config('1v1/NoWeapon/Selfplay')
+        task = SingleCombatTask(config)
+        assert config.use_artillery is True
+        assert task.use_artillery is True
 
     @pytest.mark.parametrize("config", ["1v1/NoWeapon/vsBaseline", "1v1/NoWeapon/Selfplay",
                                         "1v1/DodgeMissile/vsBaseline", "1v1/DodgeMissile/Selfplay",

@@ -71,17 +71,17 @@ except Exception as exc:
 # 可修改实验配置
 # =========================
 
-EXPERIMENT_NAME = "shoot_selfplay_2e8_A_vs_shoot_selfplay_1e8_B"
+EXPERIMENT_NAME = "follow_2e8_A_vs_follow_1e8_B"
 
 # 评估环境必须使用直接控制版 SingleCombat 场景。
-EVAL_SCENARIO_NAME = "1v1/ShootMissile/Selfplay"
+EVAL_SCENARIO_NAME = "1v1/NoWeapon/Selfplay"
 
 # 两个 actor 可以来自不同训练场景；脚本会按各自场景构造网络动作空间。
-ACTOR_A_PATH = "E:/clone/demo2/scripts/results/SingleCombat/1v1/ShootMissile/Selfplay/ppo/1v1_shoot_selfplay_2e8/wandb/offline-run-20260623_160621-nastucr3/files/actor_latest.pt"
-ACTOR_A_SCENARIO_NAME = "1v1/ShootMissile/Selfplay"
+ACTOR_A_PATH = "E:/clone/demo2/scripts/results/SingleCombat/1v1/NoWeapon/Selfplay/ppo/1v1_follow_2e8/wandb/offline-run-20260617_150234-2fbfp5qn/files/actor_latest.pt"
+ACTOR_A_SCENARIO_NAME = "1v1/NoWeapon/Selfplay"
 
-ACTOR_B_PATH = "E:/clone/demo1/scripts/results/SingleCombat/1v1/ShootMissile/Selfplay/ppo/1v1_shoot_selfplay/wandb/offline-run-20260514_140253-yxrmu45m/files/actor_latest.pt"
-ACTOR_B_SCENARIO_NAME = "1v1/ShootMissile/Selfplay"
+ACTOR_B_PATH = "E:/clone/demo1/scripts/results/SingleCombat/1v1/NoWeapon/Selfplay/ppo/1v1_follow/wandb/offline-run-20260512_175151-yryla8wg/files/actor_latest.pt"
+ACTOR_B_SCENARIO_NAME = "1v1/NoWeapon/Selfplay"
 
 # 分层 actor 的低层控制器。
 LOWLEVEL_ACTOR_PATH = REPO_ROOT / "envs/JSBSim/model/actor_heading.pt"
