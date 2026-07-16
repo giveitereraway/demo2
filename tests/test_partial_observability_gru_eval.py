@@ -11,7 +11,10 @@ from experiments.partial_observability_gru_eval import (
     DegradationConfig,
     ObservationDegrader,
     action_continuity_metrics,
+    plot_summaries,
     maybe_reset_actor_hidden,
+    resolve_actor_path,
+    scenario_config_path,
 )
 
 
@@ -120,3 +123,48 @@ def test_action_continuity_metrics_detect_large_jump():
     assert metrics["actor_a_action_total_variation"] == pytest.approx(0.25)
     assert metrics["actor_a_large_action_jump_rate"] == pytest.approx(0.5)
     assert metrics["actor_a_action_second_difference"] == pytest.approx(0.3)
+
+
+def test_actor_directory_resolves_actor_latest(tmp_path):
+    actor_path = tmp_path / "wandb" / "run" / "files" / "actor_latest.pt"
+    actor_path.parent.mkdir(parents=True)
+    actor_path.write_bytes(b"checkpoint")
+
+    assert resolve_actor_path(tmp_path) == actor_path.resolve()
+
+
+def test_core_selfplay_scenario_exists():
+    path = scenario_config_path("1v1/NoWeapon/Selfplay")
+
+    assert path.is_file()
+    assert path.name == "Selfplay.yaml"
+
+
+def test_summary_plot_accepts_advantage_confidence_interval(tmp_path, monkeypatch):
+    pytest.importorskip("matplotlib")
+    import experiments.partial_observability_gru_eval as module
+
+    monkeypatch.setattr(module, "SAVE_PLOTS", True)
+    monkeypatch.setattr(module, "PLOT_DPI", 40)
+    summaries = []
+    for index, condition_id in enumerate(("E0", "E1", "E2", "E3", "E4", "E5")):
+        value = 0.4 + index * 0.01
+        summaries.append(
+            {
+                "condition_id": condition_id,
+                "win_score": value,
+                "win_score_ci_low": value - 0.05,
+                "win_score_ci_high": value + 0.05,
+                "advantage_window_occupancy": value,
+                "advantage_window_occupancy_ci_low": value - 0.05,
+                "advantage_window_occupancy_ci_high": value + 0.05,
+                "actor_a_mean_ao_deg": 30.0,
+                "mean_distance_m": 3000.0,
+                "actor_a_action_total_variation": 0.2,
+            }
+        )
+
+    paths = plot_summaries(summaries, tmp_path)
+
+    assert len(paths) == 2
+    assert all(path.is_file() for path in paths)

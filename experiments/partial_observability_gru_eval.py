@@ -34,14 +34,13 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 # 模型与场景。相对路径均相对于仓库根目录。
 DEFAULT_ACTOR_PATH = Path(
-    "scripts/results/SingleCombat/1v1/NoWeapon/Selfplay/ppo/1v1_follow_2e8/"
-    "wandb/offline-run-20260617_150234-2fbfp5qn/files/actor_latest.pt"
+    "scripts/results/SingleCombat/1v1/NoWeapon/Selfplay/ppo/1v1_follow_2e8"
 )
 ACTOR_A_PATH = DEFAULT_ACTOR_PATH                 # 被测策略
 ACTOR_B_PATH = DEFAULT_ACTOR_PATH                 # 干净观测固定对手
 ACTOR_A_SCENARIO_NAME = "1v1/NoWeapon/Selfplay"
 ACTOR_B_SCENARIO_NAME = "1v1/NoWeapon/Selfplay"
-EVAL_SCENARIO_NAME = "1v1/Validation/NoWeapon/Eval"
+EVAL_SCENARIO_NAME = "1v1/NoWeapon/Selfplay"
 
 # 基本评估参数。
 NUM_EPISODES_PER_CONDITION = 50
@@ -152,13 +151,13 @@ EXPERIMENT_CONDITIONS: Tuple[ExperimentCondition, ...] = (
     ),
     ExperimentCondition(
         "E1",
-        "30% 敌机相对观测丢帧",
+        f"{DROPOUT_PROBABILITY:.0%} 敌机相对观测丢帧",
         DegradationConfig(dropout_probability=DROPOUT_PROBABILITY),
         sensor_seed_group=1,
     ),
     ExperimentCondition(
         "E2",
-        "敌机相对观测延迟 3 步",
+        f"敌机相对观测延迟 {OBSERVATION_DELAY_STEPS} 步",
         DegradationConfig(delay_steps=OBSERVATION_DELAY_STEPS),
         sensor_seed_group=2,
     ),
@@ -177,7 +176,7 @@ EXPERIMENT_CONDITIONS: Tuple[ExperimentCondition, ...] = (
     ),
     ExperimentCondition(
         "E5",
-        "混合观测退化，每 5 步清零 GRU",
+        f"混合观测退化，每 {RESET_GRU_EVERY_N_STEPS} 步清零 GRU",
         MIXED_DEGRADATION,
         gru_reset_interval=RESET_GRU_EVERY_N_STEPS,
         sensor_seed_group=3,
@@ -302,13 +301,21 @@ def maybe_reset_actor_hidden(controller: Any, step: int, interval: Optional[int]
 def load_base_eval_module():
     """加载现有 experiments/1v1.py，复用模型与随机初始态逻辑。"""
     module_path = Path(__file__).with_name("1v1.py")
+    if not module_path.is_file():
+        raise FileNotFoundError(f"缺少基础评估脚本: {module_path}")
     module_name = "jsbsim_1v1_eval_base"
     spec = importlib.util.spec_from_file_location(module_name, module_path)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"无法加载基础评估脚本: {module_path}")
     module = importlib.util.module_from_spec(spec)
     sys.modules[module_name] = module
-    spec.loader.exec_module(module)
+    try:
+        spec.loader.exec_module(module)
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            f"当前 Python 环境缺少依赖 {exc.name!r}。请使用原训练环境运行本脚本。"
+        ) from exc
+    validate_base_module_api(module)
     return module
 
 
@@ -317,6 +324,72 @@ def resolve_repo_path(path: Path | str) -> Path:
     if not path.is_absolute():
         path = REPO_ROOT / path
     return path.resolve()
+
+
+REQUIRED_BASE_API = (
+    "SingleCombatEnv",
+    "load_controller",
+    "validate_setup",
+    "reset_eval_env",
+    "relative_state_metrics",
+    "append_metric_history",
+    "status_name",
+    "initial_state_row",
+    "summarize_relative_history",
+    "decide_winner",
+)
+
+
+def validate_base_module_api(base: Any) -> None:
+    """在加载模型前一次性确认基础评估脚本提供了所需接口。"""
+    missing = [name for name in REQUIRED_BASE_API if not hasattr(base, name)]
+    if missing:
+        raise RuntimeError(
+            "experiments/1v1.py 缺少快速评估需要的接口: " + ", ".join(missing)
+        )
+
+
+def scenario_config_path(scenario_name: str) -> Path:
+    """把 1v1/NoWeapon/Selfplay 转换为仓库内 YAML 绝对路径。"""
+    normalized = str(scenario_name).replace("\\", "/").strip("/")
+    return (REPO_ROOT / "envs/JSBSim/configs" / f"{normalized}.yaml").resolve()
+
+
+def validate_scenario_configs(scenario_names: Iterable[str]) -> None:
+    """启动仿真前检查所有场景，避免模型加载后才报告 YAML 缺失。"""
+    missing = []
+    for scenario_name in dict.fromkeys(scenario_names):
+        path = scenario_config_path(scenario_name)
+        if not path.is_file():
+            missing.append(f"{scenario_name} -> {path}")
+    if missing:
+        raise FileNotFoundError("缺少以下场景配置:\n" + "\n".join(missing))
+
+
+def resolve_actor_path(path: Path | str) -> Path:
+    """支持传入 actor 文件或实验目录；目录中自动寻找最新 actor_latest.pt。"""
+    resolved = resolve_repo_path(path)
+    if resolved.is_file():
+        return resolved
+    if not resolved.exists():
+        raise FileNotFoundError(
+            f"Actor 路径不存在: {resolved}\n"
+            "请修改脚本开头的 ACTOR_A_PATH / ACTOR_B_PATH。"
+        )
+    if not resolved.is_dir():
+        raise FileNotFoundError(f"Actor 路径既不是文件也不是目录: {resolved}")
+
+    candidates = sorted(
+        resolved.rglob("actor_latest.pt"),
+        key=lambda item: item.stat().st_mtime,
+        reverse=True,
+    )
+    if not candidates:
+        raise FileNotFoundError(f"目录中没有找到 actor_latest.pt: {resolved}")
+    selected = candidates[0].resolve()
+    if len(candidates) > 1:
+        print(f"Actor 目录包含 {len(candidates)} 个检查点，自动选择最新文件: {selected}")
+    return selected
 
 
 def configure_base_module(base: Any) -> None:
@@ -564,8 +637,8 @@ def summarize_condition(
         ),
         "actor_a_avg_reward": float(np.mean(values("actor_a_reward"))),
         "advantage_window_occupancy": adv_mean,
-        "advantage_window_ci_low": adv_low,
-        "advantage_window_ci_high": adv_high,
+        "advantage_window_occupancy_ci_low": adv_low,
+        "advantage_window_occupancy_ci_high": adv_high,
         "actor_a_mean_ao_deg": float(np.mean(values("actor_a_mean_ao_deg"))),
         "actor_a_mean_ta_deg": float(np.mean(values("actor_a_mean_ta_deg"))),
         "mean_distance_m": float(np.mean(values("mean_distance_m"))),
@@ -737,11 +810,11 @@ def main() -> None:
     if NUM_EPISODES_PER_CONDITION <= 0:
         raise ValueError("NUM_EPISODES_PER_CONDITION 必须为正整数。")
 
-    actor_a_path = resolve_repo_path(ACTOR_A_PATH)
-    actor_b_path = resolve_repo_path(ACTOR_B_PATH)
-    for actor_path in (actor_a_path, actor_b_path):
-        if not actor_path.exists():
-            raise FileNotFoundError(f"找不到 actor 文件: {actor_path}")
+    validate_scenario_configs(
+        (ACTOR_A_SCENARIO_NAME, ACTOR_B_SCENARIO_NAME, EVAL_SCENARIO_NAME)
+    )
+    actor_a_path = resolve_actor_path(ACTOR_A_PATH)
+    actor_b_path = resolve_actor_path(ACTOR_B_PATH)
 
     base = load_base_eval_module()
     configure_base_module(base)
