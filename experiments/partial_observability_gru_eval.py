@@ -2,7 +2,8 @@
 """部分可观测鲁棒性与 GRU 历史信息有效性快速评估。
 
 本脚本只加载已有 actor，不执行训练。Actor A 和 Actor B 可分别加载手动指定的模型：
-Actor A 是被测策略：E1-E3 注入观测退化，E4-E5 在 E0 完整观测基础上清零 GRU 隐状态；
+Actor A 是被测策略：E1-E3 注入由低到高的混合观测退化，
+E4-E6 在 E0 完整观测基础上按由大到小的周期清零 GRU 隐状态；
 Actor B 始终接收干净观测并正常保持 GRU 隐状态。
 
 运行方式：
@@ -72,22 +73,43 @@ RANDOM_INITIAL_STATE_CONFIG = {
     "heading_noise_deg": 20.0,
 }
 
-# E1：目标相对观测丢帧。丢帧时保持上一帧有效相对观测。
-DROPOUT_PROBABILITY = 0.30
+# E1-E3：混合观测退化参数，依次对应低、中、高退化。
+# 每一组都同时包含噪声、丢帧和观测延迟；当前环境每个决策步约为 0.2 秒。
+# 角度噪声作用于 AO/TA，距离单位为米；丢帧时保持上一帧有效相对观测。
+MIXED_DEGRADATION_PARAMETERS = {
+    "E1": {
+        "dropout_probability": 0.10,
+        "delay_steps": 1,
+        "angle_noise_std_deg": 1.0,
+        "range_noise_std_m": 100.0,
+        "relative_speed_noise_std_mps": 0.0,
+        "relative_altitude_noise_std_m": 0.0,
+    },
+    "E2": {
+        "dropout_probability": 0.20,
+        "delay_steps": 2,
+        "angle_noise_std_deg": 3.0,
+        "range_noise_std_m": 200.0,
+        "relative_speed_noise_std_mps": 0.0,
+        "relative_altitude_noise_std_m": 0.0,
+    },
+    "E3": {
+        "dropout_probability": 0.30,
+        "delay_steps": 3,
+        "angle_noise_std_deg": 5.0,
+        "range_noise_std_m": 300.0,
+        "relative_speed_noise_std_mps": 0.0,
+        "relative_altitude_noise_std_m": 0.0,
+    },
+}
 
-# E2：目标相对观测时延。当前环境每个决策步为 0.2 秒。
-OBSERVATION_DELAY_STEPS = 3
-
-# E3：混合退化。角度对应 AO/TA，距离单位为米。
-ANGLE_NOISE_STD_DEG = 5.0
-RANGE_NOISE_STD_M = 300.0
-RELATIVE_SPEED_NOISE_STD_MPS = 0.0
-RELATIVE_ALTITUDE_NOISE_STD_M = 0.0
-
-# E4/E5：基于 E0 完整观测，只改变 GRU 隐状态清零间隔。
-# 1 表示每步清零，5 表示最多保留约 1 秒历史。
-RESET_GRU_EVERY_STEP = 1
-RESET_GRU_EVERY_N_STEPS = 5
+# E4-E6：均使用 E0 完整观测，只改变 GRU 隐状态清零间隔。
+# 清零间隔由大到小；1 表示每个决策步都清零，基本无法利用历史观测。
+GRU_RESET_INTERVALS = {
+    "E4": 20,                                   # 约每 4 秒清零
+    "E5": 5,                                    # 约每 1 秒清零
+    "E6": 1,                                    # 每步清零
+}
 
 # 优势窗口和动作连续性判据。
 ADVANTAGE_AO_MAX_DEG = 30.0
@@ -101,6 +123,7 @@ SAVE_ACMI = True
 ACMI_EPISODES = {0}                              # 每个实验组保存哪些回合的轨迹
 SAVE_PLOTS = True
 PLOT_DPI = 180
+REWARD_MOVING_AVERAGE_WINDOW = 10                # 单局奖励曲线的滑动平均窗口
 BOOTSTRAP_SAMPLES = 2000
 SUPPRESS_POLICY_DEBUG_PRINT = True
 
@@ -140,17 +163,13 @@ class ExperimentCondition:
     sensor_seed_group: int = 0
 
 
-MIXED_DEGRADATION = DegradationConfig(
-    dropout_probability=DROPOUT_PROBABILITY,
-    delay_steps=OBSERVATION_DELAY_STEPS,
-    angle_noise_std_deg=ANGLE_NOISE_STD_DEG,
-    range_noise_std_m=RANGE_NOISE_STD_M,
-    relative_speed_noise_std_mps=RELATIVE_SPEED_NOISE_STD_MPS,
-    relative_altitude_noise_std_m=RELATIVE_ALTITUDE_NOISE_STD_M,
-)
+MIXED_DEGRADATION_CONFIGS = {
+    condition_id: DegradationConfig(**parameters)
+    for condition_id, parameters in MIXED_DEGRADATION_PARAMETERS.items()
+}
 
 ROBUSTNESS_CONDITION_IDS = ("E0", "E1", "E2", "E3")
-GRU_HISTORY_CONDITION_IDS = ("E0", "E4", "E5")
+GRU_HISTORY_CONDITION_IDS = ("E0", "E4", "E5", "E6")
 
 EXPERIMENT_CONDITIONS: Tuple[ExperimentCondition, ...] = (
     ExperimentCondition(
@@ -161,37 +180,92 @@ EXPERIMENT_CONDITIONS: Tuple[ExperimentCondition, ...] = (
     ),
     ExperimentCondition(
         "E1",
-        f"{DROPOUT_PROBABILITY:.0%} 敌机相对观测丢帧",
-        DegradationConfig(dropout_probability=DROPOUT_PROBABILITY),
+        "低度混合观测退化（噪声+丢帧+延迟）",
+        MIXED_DEGRADATION_CONFIGS["E1"],
         sensor_seed_group=1,
     ),
     ExperimentCondition(
         "E2",
-        f"敌机相对观测延迟 {OBSERVATION_DELAY_STEPS} 步",
-        DegradationConfig(delay_steps=OBSERVATION_DELAY_STEPS),
-        sensor_seed_group=2,
+        "中度混合观测退化（噪声+丢帧+延迟）",
+        MIXED_DEGRADATION_CONFIGS["E2"],
+        sensor_seed_group=1,
     ),
     ExperimentCondition(
         "E3",
-        "混合观测退化，GRU 正常",
-        MIXED_DEGRADATION,
-        sensor_seed_group=3,
+        "高度混合观测退化（噪声+丢帧+延迟）",
+        MIXED_DEGRADATION_CONFIGS["E3"],
+        sensor_seed_group=1,
     ),
     ExperimentCondition(
         "E4",
-        "完整观测，每步清零 GRU",
+        f"完整观测，每 {GRU_RESET_INTERVALS['E4']} 步清零 GRU",
         DegradationConfig(),
-        gru_reset_interval=RESET_GRU_EVERY_STEP,
+        gru_reset_interval=GRU_RESET_INTERVALS["E4"],
         sensor_seed_group=0,
     ),
     ExperimentCondition(
         "E5",
-        f"完整观测，每 {RESET_GRU_EVERY_N_STEPS} 步清零 GRU",
+        f"完整观测，每 {GRU_RESET_INTERVALS['E5']} 步清零 GRU",
         DegradationConfig(),
-        gru_reset_interval=RESET_GRU_EVERY_N_STEPS,
+        gru_reset_interval=GRU_RESET_INTERVALS["E5"],
+        sensor_seed_group=0,
+    ),
+    ExperimentCondition(
+        "E6",
+        f"完整观测，每 {GRU_RESET_INTERVALS['E6']} 步清零 GRU",
+        DegradationConfig(),
+        gru_reset_interval=GRU_RESET_INTERVALS["E6"],
         sensor_seed_group=0,
     ),
 )
+
+
+def validate_experiment_design() -> None:
+    """检查可调参数仍满足两组实验的单变量与强度顺序要求。"""
+    degradation_fields = (
+        "dropout_probability",
+        "delay_steps",
+        "angle_noise_std_deg",
+        "range_noise_std_m",
+        "relative_speed_noise_std_mps",
+        "relative_altitude_noise_std_m",
+    )
+    degradation_ids = ("E1", "E2", "E3")
+    configs = [MIXED_DEGRADATION_CONFIGS[item_id] for item_id in degradation_ids]
+    for item_id, config in zip(degradation_ids, configs):
+        if not 0.0 < config.dropout_probability <= 1.0:
+            raise ValueError(f"{item_id} 的丢帧概率必须位于 (0, 1]。")
+        if config.delay_steps <= 0:
+            raise ValueError(f"{item_id} 的观测延迟必须为正整数。")
+        noise_values = (
+            config.angle_noise_std_deg,
+            config.range_noise_std_m,
+            config.relative_speed_noise_std_mps,
+            config.relative_altitude_noise_std_m,
+        )
+        if any(value < 0 for value in noise_values) or not any(
+            value > 0 for value in noise_values
+        ):
+            raise ValueError(f"{item_id} 必须包含至少一种非零且非负的观测噪声。")
+
+    for field in degradation_fields:
+        values = [getattr(config, field) for config in configs]
+        if any(left > right for left, right in zip(values, values[1:])):
+            raise ValueError(f"E1-E3 的 {field} 必须由低到高设置。")
+    for lower, higher in zip(configs, configs[1:]):
+        if not any(
+            getattr(lower, field) < getattr(higher, field)
+            for field in degradation_fields
+        ):
+            raise ValueError("E1、E2、E3 的退化程度必须逐级增强。")
+
+    reset_intervals = [GRU_RESET_INTERVALS[item_id] for item_id in ("E4", "E5", "E6")]
+    if any(not isinstance(interval, int) or interval <= 0 for interval in reset_intervals):
+        raise ValueError("E4-E6 的 GRU 清零间隔必须为正整数。")
+    if not reset_intervals[0] > reset_intervals[1] > reset_intervals[2]:
+        raise ValueError("E4、E5、E6 的 GRU 清零间隔必须由大到小。")
+    if REWARD_MOVING_AVERAGE_WINDOW <= 0:
+        raise ValueError("奖励曲线滑动平均窗口必须为正整数。")
 
 
 # =============================================================================
@@ -687,9 +761,10 @@ def save_json(data: Any, path: Path) -> None:
         json.dump(data, file, ensure_ascii=False, indent=2)
 
 
-def plot_summaries(summaries: List[Dict[str, object]], output_dir: Path) -> List[Path]:
+def load_pyplot() -> Optional[Any]:
+    """加载无界面的绘图库，并统一中文字体设置。"""
     if not SAVE_PLOTS:
-        return []
+        return None
     try:
         import matplotlib
 
@@ -697,7 +772,7 @@ def plot_summaries(summaries: List[Dict[str, object]], output_dir: Path) -> List
         import matplotlib.pyplot as plt
     except Exception as exc:
         print(f"跳过绘图，matplotlib 不可用: {exc}")
-        return []
+        return None
 
     plt.rcParams.update(
         {
@@ -705,6 +780,14 @@ def plot_summaries(summaries: List[Dict[str, object]], output_dir: Path) -> List
             "axes.unicode_minus": False,
         }
     )
+    return plt
+
+
+def plot_summaries(summaries: List[Dict[str, object]], output_dir: Path) -> List[Path]:
+    plt = load_pyplot()
+    if plt is None:
+        return []
+
     plot_dir = output_dir / "plots"
     plot_dir.mkdir(parents=True, exist_ok=True)
     paths: List[Path] = []
@@ -787,6 +870,101 @@ def plot_summaries(summaries: List[Dict[str, object]], output_dir: Path) -> List
     return paths
 
 
+def trailing_moving_average(values: Sequence[float], window: int) -> np.ndarray:
+    """计算包含当前回合的后向滑动平均，开头不足窗口时使用已有回合。"""
+    if window <= 0:
+        raise ValueError("滑动平均窗口必须为正整数。")
+    array = np.asarray(values, dtype=np.float64)
+    if array.ndim != 1:
+        raise ValueError("滑动平均输入必须是一维序列。")
+    if array.size == 0:
+        return array.copy()
+
+    result = np.empty_like(array)
+    cumulative = np.cumsum(array, dtype=np.float64)
+    for index in range(array.size):
+        start = max(0, index - window + 1)
+        total = cumulative[index]
+        if start > 0:
+            total -= cumulative[start - 1]
+        result[index] = total / (index - start + 1)
+    return result
+
+
+def plot_episode_reward_curves(
+    rows: List[Dict[str, object]], output_dir: Path
+) -> List[Path]:
+    """绘制两组 Actor A 单局奖励及其滑动平均曲线。"""
+    plt = load_pyplot()
+    if plt is None:
+        return []
+
+    plot_dir = output_dir / "plots"
+    plot_dir.mkdir(parents=True, exist_ok=True)
+    figure, axes = plt.subplots(1, 2, figsize=(15, 5), sharex=True)
+    groups = (
+        ("实验一：混合观测退化", ROBUSTNESS_CONDITION_IDS),
+        ("实验二：完整观测下的 GRU 历史消融", GRU_HISTORY_CONDITION_IDS),
+    )
+    colors = plt.get_cmap("tab10").colors
+
+    for axis, (title, condition_ids) in zip(axes, groups):
+        for color_index, condition_id in enumerate(condition_ids):
+            condition_rows = sorted(
+                (
+                    row
+                    for row in rows
+                    if str(row["condition_id"]) == condition_id
+                ),
+                key=lambda row: int(row["episode"]),
+            )
+            if not condition_rows:
+                raise ValueError(f"缺少 {condition_id} 的单局奖励数据，无法绘图。")
+
+            episodes = np.asarray(
+                [int(row["episode"]) + 1 for row in condition_rows],
+                dtype=np.int64,
+            )
+            rewards = np.asarray(
+                [float(row["actor_a_reward"]) for row in condition_rows],
+                dtype=np.float64,
+            )
+            smoothed = trailing_moving_average(
+                rewards, REWARD_MOVING_AVERAGE_WINDOW
+            )
+            color = colors[color_index % len(colors)]
+            axis.plot(
+                episodes,
+                rewards,
+                color=color,
+                alpha=0.22,
+                linewidth=0.9,
+            )
+            axis.plot(
+                episodes,
+                smoothed,
+                color=color,
+                linewidth=2.0,
+                label=f"{condition_id} 滑动平均",
+            )
+
+        axis.set_title(title)
+        axis.set_xlabel("测试局数")
+        axis.set_ylabel("Actor A 单局累计奖励")
+        axis.grid(alpha=0.25)
+        axis.legend()
+
+    figure.suptitle(
+        "Actor A 单局奖励曲线"
+        f"（细线=单局奖励，粗线={REWARD_MOVING_AVERAGE_WINDOW}局滑动平均）"
+    )
+    figure.tight_layout()
+    path = plot_dir / "episode_reward_curves.png"
+    figure.savefig(path, dpi=PLOT_DPI, bbox_inches="tight")
+    plt.close(figure)
+    return [path]
+
+
 def config_snapshot(actor_a_path: Path, actor_b_path: Path) -> Dict[str, object]:
     return {
         "actor_a_path": str(actor_a_path),
@@ -801,6 +979,7 @@ def config_snapshot(actor_a_path: Path, actor_b_path: Path) -> Dict[str, object]
         "deterministic": DETERMINISTIC,
         "swap_actor_order": SWAP_ACTOR_ORDER,
         "strict_winner": STRICT_WINNER,
+        "reward_moving_average_window": REWARD_MOVING_AVERAGE_WINDOW,
         "initial_state_mode": INITIAL_STATE_MODE,
         "random_initial_state_config": RANDOM_INITIAL_STATE_CONFIG,
         "advantage_window": {
@@ -821,6 +1000,7 @@ def config_snapshot(actor_a_path: Path, actor_b_path: Path) -> Dict[str, object]
 def main() -> None:
     if NUM_EPISODES_PER_CONDITION <= 0:
         raise ValueError("NUM_EPISODES_PER_CONDITION 必须为正整数。")
+    validate_experiment_design()
 
     validate_scenario_configs(
         (ACTOR_A_SCENARIO_NAME, ACTOR_B_SCENARIO_NAME, EVAL_SCENARIO_NAME)
@@ -910,6 +1090,7 @@ def main() -> None:
     save_csv(all_rows, output_dir / "all_episodes.csv")
     save_csv(summaries, output_dir / "summary.csv")
     plot_paths = plot_summaries(summaries, output_dir)
+    plot_paths.extend(plot_episode_reward_curves(all_rows, output_dir))
     combined_summary = {
         "output_dir": str(output_dir),
         "conditions": summaries,

@@ -8,17 +8,21 @@ from experiments.partial_observability_gru_eval import (
     DISTANCE_INDEX,
     EXPERIMENT_CONDITIONS,
     GRU_HISTORY_CONDITION_IDS,
+    GRU_RESET_INTERVALS,
+    MIXED_DEGRADATION_CONFIGS,
     RELATIVE_FEATURE_SLICE,
-    RESET_GRU_EVERY_N_STEPS,
-    RESET_GRU_EVERY_STEP,
+    ROBUSTNESS_CONDITION_IDS,
     TA_INDEX,
     DegradationConfig,
     ObservationDegrader,
     action_continuity_metrics,
+    plot_episode_reward_curves,
     plot_summaries,
     maybe_reset_actor_hidden,
     resolve_actor_path,
     scenario_config_path,
+    trailing_moving_average,
+    validate_experiment_design,
 )
 
 
@@ -120,16 +124,53 @@ def test_gru_ablation_uses_e0_complete_observation_baseline():
         condition.condition_id: condition for condition in EXPERIMENT_CONDITIONS
     }
 
-    assert GRU_HISTORY_CONDITION_IDS == ("E0", "E4", "E5")
+    assert GRU_HISTORY_CONDITION_IDS == ("E0", "E4", "E5", "E6")
     assert conditions["E0"].degradation == DegradationConfig()
-    assert conditions["E4"].degradation == conditions["E0"].degradation
-    assert conditions["E5"].degradation == conditions["E0"].degradation
-    assert conditions["E3"].degradation != conditions["E0"].degradation
-    assert conditions["E4"].sensor_seed_group == conditions["E0"].sensor_seed_group
-    assert conditions["E5"].sensor_seed_group == conditions["E0"].sensor_seed_group
+    for condition_id in ("E4", "E5", "E6"):
+        assert conditions[condition_id].degradation == conditions["E0"].degradation
+        assert (
+            conditions[condition_id].sensor_seed_group
+            == conditions["E0"].sensor_seed_group
+        )
+        assert (
+            conditions[condition_id].gru_reset_interval
+            == GRU_RESET_INTERVALS[condition_id]
+        )
     assert conditions["E0"].gru_reset_interval is None
-    assert conditions["E4"].gru_reset_interval == RESET_GRU_EVERY_STEP
-    assert conditions["E5"].gru_reset_interval == RESET_GRU_EVERY_N_STEPS
+    assert (
+        GRU_RESET_INTERVALS["E4"]
+        > GRU_RESET_INTERVALS["E5"]
+        > GRU_RESET_INTERVALS["E6"]
+    )
+
+
+def test_mixed_degradation_increases_from_e1_to_e3():
+    conditions = {
+        condition.condition_id: condition for condition in EXPERIMENT_CONDITIONS
+    }
+    assert ROBUSTNESS_CONDITION_IDS == ("E0", "E1", "E2", "E3")
+    configs = [conditions[item_id].degradation for item_id in ("E1", "E2", "E3")]
+    assert configs == [
+        MIXED_DEGRADATION_CONFIGS[item_id] for item_id in ("E1", "E2", "E3")
+    ]
+    assert len({conditions[item_id].sensor_seed_group for item_id in ("E1", "E2", "E3")}) == 1
+
+    fields = (
+        "dropout_probability",
+        "delay_steps",
+        "angle_noise_std_deg",
+        "range_noise_std_m",
+    )
+    for config in configs:
+        assert config.dropout_probability > 0
+        assert config.delay_steps > 0
+        assert config.angle_noise_std_deg > 0
+        assert config.range_noise_std_m > 0
+    for field in fields:
+        values = [getattr(config, field) for config in configs]
+        assert values == sorted(values)
+
+    validate_experiment_design()
 
 
 def test_action_continuity_metrics_detect_large_jump():
@@ -144,6 +185,12 @@ def test_action_continuity_metrics_detect_large_jump():
     assert metrics["actor_a_action_total_variation"] == pytest.approx(0.25)
     assert metrics["actor_a_large_action_jump_rate"] == pytest.approx(0.5)
     assert metrics["actor_a_action_second_difference"] == pytest.approx(0.3)
+
+
+def test_trailing_moving_average_uses_available_recent_episodes():
+    actual = trailing_moving_average([1.0, 2.0, 4.0, 8.0], window=2)
+
+    np.testing.assert_allclose(actual, [1.0, 1.5, 3.0, 6.0])
 
 
 def test_actor_directory_resolves_actor_latest(tmp_path):
@@ -168,7 +215,9 @@ def test_summary_plot_accepts_advantage_confidence_interval(tmp_path, monkeypatc
     monkeypatch.setattr(module, "SAVE_PLOTS", True)
     monkeypatch.setattr(module, "PLOT_DPI", 40)
     summaries = []
-    for index, condition_id in enumerate(("E0", "E1", "E2", "E3", "E4", "E5")):
+    for index, condition_id in enumerate(
+        ("E0", "E1", "E2", "E3", "E4", "E5", "E6")
+    ):
         value = 0.4 + index * 0.01
         summaries.append(
             {
@@ -191,3 +240,28 @@ def test_summary_plot_accepts_advantage_confidence_interval(tmp_path, monkeypatc
 
     assert len(paths) == 2
     assert all(path.is_file() for path in paths)
+
+
+def test_episode_reward_curves_include_both_experiment_groups(tmp_path, monkeypatch):
+    pytest.importorskip("matplotlib")
+    import experiments.partial_observability_gru_eval as module
+
+    monkeypatch.setattr(module, "SAVE_PLOTS", True)
+    monkeypatch.setattr(module, "PLOT_DPI", 40)
+    monkeypatch.setattr(module, "REWARD_MOVING_AVERAGE_WINDOW", 2)
+    rows = []
+    for condition_id in ("E0", "E1", "E2", "E3", "E4", "E5", "E6"):
+        for episode, reward in enumerate((1.0, 2.0, 3.0)):
+            rows.append(
+                {
+                    "condition_id": condition_id,
+                    "episode": episode,
+                    "actor_a_reward": reward,
+                }
+            )
+
+    paths = plot_episode_reward_curves(rows, tmp_path)
+
+    assert len(paths) == 1
+    assert paths[0].name == "episode_reward_curves.png"
+    assert paths[0].is_file()
