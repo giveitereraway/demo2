@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """部分可观测鲁棒性与 GRU 历史信息有效性快速评估。
 
-本脚本只加载已有 actor，不执行训练。默认让同一个 actor 分别控制双方飞机：
+本脚本只加载已有 actor，不执行训练。Actor A 和 Actor B 可分别加载手动指定的模型：
 Actor A 是被测策略：E1-E3 注入观测退化，E4-E5 在 E0 完整观测基础上清零 GRU 隐状态；
 Actor B 始终接收干净观测并正常保持 GRU 隐状态。
 
@@ -32,12 +32,18 @@ import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
-# 模型与场景。相对路径均相对于仓库根目录。
-DEFAULT_ACTOR_PATH = Path(
-    "scripts/results/SingleCombat/1v1/NoWeapon/Selfplay/ppo/1v1_follow_2e8"
+# Actor 模型绝对路径：请分别手动修改为要评估的模型。
+# 可以填写具体 actor_latest.pt，也可以填写包含该文件的实验目录。
+ACTOR_A_PATH = Path(
+    "/root/autodl-tmp/demo2/scripts/results/SingleCombat/1v1/NoWeapon/"
+    "Selfplay/ppo/1v1_follow_2e8"
 )
-ACTOR_A_PATH = DEFAULT_ACTOR_PATH                 # 被测策略
-ACTOR_B_PATH = DEFAULT_ACTOR_PATH                 # 干净观测固定对手
+ACTOR_B_PATH = Path(
+    "/root/autodl-tmp/demo2/scripts/results/SingleCombat/1v1/NoWeapon/"
+    "Selfplay/ppo/1v1_follow_2e8"
+)
+
+# Actor A/B 对应的训练场景以及本次评估场景。
 ACTOR_A_SCENARIO_NAME = "1v1/NoWeapon/Selfplay"
 ACTOR_B_SCENARIO_NAME = "1v1/NoWeapon/Selfplay"
 EVAL_SCENARIO_NAME = "1v1/NoWeapon/Selfplay"
