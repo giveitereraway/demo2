@@ -2,7 +2,7 @@
 """部分可观测鲁棒性与 GRU 历史信息有效性快速评估。
 
 本脚本只加载已有 actor，不执行训练。默认让同一个 actor 分别控制双方飞机：
-Actor A 是被测策略，会按 E0-E5 注入观测退化或清零 GRU 隐状态；
+Actor A 是被测策略：E1-E3 注入观测退化，E4-E5 在 E0 完整观测基础上清零 GRU 隐状态；
 Actor B 始终接收干净观测并正常保持 GRU 隐状态。
 
 运行方式：
@@ -72,13 +72,14 @@ DROPOUT_PROBABILITY = 0.30
 # E2：目标相对观测时延。当前环境每个决策步为 0.2 秒。
 OBSERVATION_DELAY_STEPS = 3
 
-# E3-E5：混合退化。角度对应 AO/TA，距离单位为米。
+# E3：混合退化。角度对应 AO/TA，距离单位为米。
 ANGLE_NOISE_STD_DEG = 5.0
 RANGE_NOISE_STD_M = 300.0
 RELATIVE_SPEED_NOISE_STD_MPS = 0.0
 RELATIVE_ALTITUDE_NOISE_STD_M = 0.0
 
-# E4/E5：GRU 隐状态清零间隔。1 表示每步清零，5 表示最多保留约 1 秒历史。
+# E4/E5：基于 E0 完整观测，只改变 GRU 隐状态清零间隔。
+# 1 表示每步清零，5 表示最多保留约 1 秒历史。
 RESET_GRU_EVERY_STEP = 1
 RESET_GRU_EVERY_N_STEPS = 5
 
@@ -142,6 +143,9 @@ MIXED_DEGRADATION = DegradationConfig(
     relative_altitude_noise_std_m=RELATIVE_ALTITUDE_NOISE_STD_M,
 )
 
+ROBUSTNESS_CONDITION_IDS = ("E0", "E1", "E2", "E3")
+GRU_HISTORY_CONDITION_IDS = ("E0", "E4", "E5")
+
 EXPERIMENT_CONDITIONS: Tuple[ExperimentCondition, ...] = (
     ExperimentCondition(
         "E0",
@@ -169,17 +173,17 @@ EXPERIMENT_CONDITIONS: Tuple[ExperimentCondition, ...] = (
     ),
     ExperimentCondition(
         "E4",
-        "混合观测退化，每步清零 GRU",
-        MIXED_DEGRADATION,
+        "完整观测，每步清零 GRU",
+        DegradationConfig(),
         gru_reset_interval=RESET_GRU_EVERY_STEP,
-        sensor_seed_group=3,
+        sensor_seed_group=0,
     ),
     ExperimentCondition(
         "E5",
-        f"混合观测退化，每 {RESET_GRU_EVERY_N_STEPS} 步清零 GRU",
-        MIXED_DEGRADATION,
+        f"完整观测，每 {RESET_GRU_EVERY_N_STEPS} 步清零 GRU",
+        DegradationConfig(),
         gru_reset_interval=RESET_GRU_EVERY_N_STEPS,
-        sensor_seed_group=3,
+        sensor_seed_group=0,
     ),
 )
 
@@ -710,7 +714,7 @@ def plot_summaries(summaries: List[Dict[str, object]], output_dir: Path) -> List
             float(summary[f"{key}_ci_high"]) - value,
         )
 
-    robustness = subset(["E0", "E1", "E2", "E3"])
+    robustness = subset(ROBUSTNESS_CONDITION_IDS)
     figure, axes = plt.subplots(2, 2, figsize=(11, 8))
     ids = [str(item["condition_id"]) for item in robustness]
     win_errors = np.asarray([error(item, "win_score") for item in robustness]).T
@@ -747,26 +751,28 @@ def plot_summaries(summaries: List[Dict[str, object]], output_dir: Path) -> List
     plt.close(figure)
     paths.append(path)
 
-    memory = subset(["E3", "E4", "E5"])
-    figure, axes = plt.subplots(1, 3, figsize=(13, 4))
+    memory = subset(GRU_HISTORY_CONDITION_IDS)
+    figure, axes = plt.subplots(2, 2, figsize=(11, 8))
     ids = [str(item["condition_id"]) for item in memory]
-    axes[0].bar(ids, [item["win_score"] for item in memory], color="#1f77b4")
-    axes[0].set_title("胜负得分")
-    axes[0].set_ylim(0.0, 1.0)
-    axes[1].bar(
+    axes[0, 0].bar(ids, [item["actor_a_win_rate"] for item in memory], color="#1f77b4")
+    axes[0, 0].set_title("Actor A 胜率")
+    axes[0, 0].set_ylim(0.0, 1.0)
+    axes[0, 1].bar(ids, [item["actor_a_avg_reward"] for item in memory], color="#ff7f0e")
+    axes[0, 1].set_title("Actor A 平均回报")
+    axes[1, 0].bar(
         ids,
         [item["advantage_window_occupancy"] for item in memory],
         color="#2ca02c",
     )
-    axes[1].set_title("优势窗口占用率")
-    axes[1].set_ylim(0.0, 1.0)
-    axes[2].bar(
+    axes[1, 0].set_title("优势窗口占用率")
+    axes[1, 0].set_ylim(0.0, 1.0)
+    axes[1, 1].bar(
         ids,
         [item["actor_a_action_total_variation"] for item in memory],
         color="#d62728",
     )
-    axes[2].set_title("平均动作总变差")
-    figure.suptitle("实验二：GRU 历史信息有效性")
+    axes[1, 1].set_title("平均动作总变差")
+    figure.suptitle("实验二：完整观测下的 GRU 历史信息有效性")
     figure.tight_layout()
     path = plot_dir / "experiment_2_gru_history.png"
     figure.savefig(path, dpi=PLOT_DPI, bbox_inches="tight")
@@ -885,6 +891,14 @@ def main() -> None:
             summary["advantage_change_from_e0"] = (
                 float(summary["advantage_window_occupancy"])
                 - float(baseline["advantage_window_occupancy"])
+            )
+            summary["actor_a_win_rate_change_from_e0"] = (
+                float(summary["actor_a_win_rate"])
+                - float(baseline["actor_a_win_rate"])
+            )
+            summary["actor_a_reward_change_from_e0"] = (
+                float(summary["actor_a_avg_reward"])
+                - float(baseline["actor_a_avg_reward"])
             )
 
     save_csv(all_rows, output_dir / "all_episodes.csv")

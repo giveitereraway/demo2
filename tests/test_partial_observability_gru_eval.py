@@ -6,7 +6,11 @@ import pytest
 from experiments.partial_observability_gru_eval import (
     AO_INDEX,
     DISTANCE_INDEX,
+    EXPERIMENT_CONDITIONS,
+    GRU_HISTORY_CONDITION_IDS,
     RELATIVE_FEATURE_SLICE,
+    RESET_GRU_EVERY_N_STEPS,
+    RESET_GRU_EVERY_STEP,
     TA_INDEX,
     DegradationConfig,
     ObservationDegrader,
@@ -111,6 +115,23 @@ def test_gru_hidden_reset_obeys_interval():
     np.testing.assert_allclose(controller.rnn_states, 0.0)
 
 
+def test_gru_ablation_uses_e0_complete_observation_baseline():
+    conditions = {
+        condition.condition_id: condition for condition in EXPERIMENT_CONDITIONS
+    }
+
+    assert GRU_HISTORY_CONDITION_IDS == ("E0", "E4", "E5")
+    assert conditions["E0"].degradation == DegradationConfig()
+    assert conditions["E4"].degradation == conditions["E0"].degradation
+    assert conditions["E5"].degradation == conditions["E0"].degradation
+    assert conditions["E3"].degradation != conditions["E0"].degradation
+    assert conditions["E4"].sensor_seed_group == conditions["E0"].sensor_seed_group
+    assert conditions["E5"].sensor_seed_group == conditions["E0"].sensor_seed_group
+    assert conditions["E0"].gru_reset_interval is None
+    assert conditions["E4"].gru_reset_interval == RESET_GRU_EVERY_STEP
+    assert conditions["E5"].gru_reset_interval == RESET_GRU_EVERY_N_STEPS
+
+
 def test_action_continuity_metrics_detect_large_jump():
     actions = [
         np.array([0.0, 0.0, 0.0, 0.5]),
@@ -152,6 +173,8 @@ def test_summary_plot_accepts_advantage_confidence_interval(tmp_path, monkeypatc
         summaries.append(
             {
                 "condition_id": condition_id,
+                "actor_a_win_rate": value,
+                "actor_a_avg_reward": value * 10.0,
                 "win_score": value,
                 "win_score_ci_low": value - 0.05,
                 "win_score_ci_high": value + 0.05,
