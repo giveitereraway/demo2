@@ -114,8 +114,11 @@ class ShareJSBSimRunner(Runner):
                 self.log_info(train_infos, self.total_num_steps)
 
             # eval
-            if episode % self.eval_interval == 0 and self.use_eval:
-                self.eval(self.total_num_steps)
+            if self.use_eval and (episode % self.eval_interval == 0 or episode == episodes - 1):
+                eval_reward = self.eval(self.total_num_steps)
+                if self.check_early_stopping(eval_reward, self.total_num_steps):
+                    self.save(episode)
+                    break
 
     def warmup(self):
         # reset env
@@ -288,6 +291,7 @@ class ShareJSBSimRunner(Runner):
         if self.use_selfplay:
             self.reset_opponent()
         logging.info("...End evaluation")
+        return float(eval_infos['eval_average_episode_rewards'])
 
     @torch.no_grad()
     def render(self):
@@ -346,10 +350,8 @@ class ShareJSBSimRunner(Runner):
         logging.info("render episode reward of agent: " + str(render_infos['render_episode_reward']))
 
     def save(self, episode):
+        super().save()
         policy_actor_state_dict = self.policy.actor.state_dict()
-        torch.save(policy_actor_state_dict, str(self.save_dir) + '/actor_latest.pt')
-        policy_critic_state_dict = self.policy.critic.state_dict()
-        torch.save(policy_critic_state_dict, str(self.save_dir) + '/critic_latest.pt')
         # [Selfplay] save policy & performance
         if self.use_selfplay:
             torch.save(policy_actor_state_dict, str(self.save_dir) + f'/actor_{episode}.pt')

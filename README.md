@@ -68,6 +68,16 @@ The description of parameter setting refers to `config.py`.
 Note that we set parameters `--use-selfplay --selfplay-algorithm --n-choose-opponents --use-eval --n-eval-rollout-threads --eval-interval --eval-episodes` in selfplay-setting training. `--use-prior` is only set true for shoot missile tasks.
 We use wandb to track the training process. If you set `--use-wandb`, please replace the `--wandb-name` with your name. 
 
+训练时添加 `--use-eval --use-early-stop` 可启用工程早停，适用于普通 PPO、自博弈 PPO 和 MAPPO：
+
+```bash
+python scripts/train/train_jsbsim.py --env-name SingleControl --scenario-name 1/heading --num-env-steps 1e8 --use-eval --use-early-stop
+```
+
+默认在总环境步数预算的 20% 之后开始累计无提升次数，连续 10 次验证平均回合奖励未严格超过历史最佳值时停止；可用 `--early-stop-min-steps 2e7 --early-stop-patience 10` 调整。一次验证指完成 `--eval-episodes` 个回合，验证频率沿用 `--eval-interval`。
+
+开启验证后，从第一次有效验证起保存最佳 `actor_best.pt` / `critic_best.pt`（与是否启用早停无关）；训练正常结束或早停时保存最后的 `actor_latest.pt` / `critic_latest.pt`，结束前也会验证最后模型。自博弈的历史快照和对手采样逻辑继续保留，验证奖励仍受抽取对手强弱影响。未加 `--use-early-stop` 时不提前停止；`--model-dir` 沿用原有权重加载方式，新一轮训练重新累计早停状态。
+
 ### Evaluate and Render
 ```bash
 cd renders

@@ -92,12 +92,19 @@ class JSBSimRunner(Runner):
                 self.log_info(train_infos, self.total_num_steps)
 
             # eval
-            if episode % self.eval_interval == 0 and episode != 0 and self.use_eval:
-                    self.eval(self.total_num_steps)
+            should_stop = False
+            if self.use_eval and ((episode % self.eval_interval == 0 and episode != 0) or episode == episodes - 1):
+                # 短训练也评估最后模型；自博弈首次评估前需有可加载的对手快照。
+                if self.use_selfplay and not self.policy_pool:
+                    self.save(episode)
+                eval_reward = self.eval(self.total_num_steps)
+                should_stop = self.check_early_stopping(eval_reward, self.total_num_steps)
 
             # save model
-            if (episode % self.save_interval == 0) or (episode == episodes - 1):
+            if (episode % self.save_interval == 0) or (episode == episodes - 1) or should_stop:
                 self.save(episode)
+            if should_stop:
+                break
 
     def warmup(self):
         # reset env
@@ -196,6 +203,7 @@ class JSBSimRunner(Runner):
         logging.info(" eval average episode rewards: " + str(np.mean(eval_infos['eval_average_episode_rewards'])))
         self.log_info(eval_infos, total_num_steps)
         logging.info("...End evaluation")
+        return float(np.mean(eval_infos['eval_average_episode_rewards']))
 
     @torch.no_grad()
     def render(self):
@@ -227,7 +235,4 @@ class JSBSimRunner(Runner):
         logging.info("render episode reward of agent: " + str(render_infos['render_episode_reward']))
 
     def save(self, episode):
-        policy_actor_state_dict = self.policy.actor.state_dict()
-        torch.save(policy_actor_state_dict, str(self.save_dir) + '/actor_latest.pt')
-        policy_critic_state_dict = self.policy.critic.state_dict()
-        torch.save(policy_critic_state_dict, str(self.save_dir) + '/critic_latest.pt')
+        super().save()

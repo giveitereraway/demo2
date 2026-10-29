@@ -80,6 +80,8 @@ def parse_args(args, parser):
     group.add_argument('--render-mode', type=str, default='txt',
                        help="txt or real_time")
     all_args = parser.parse_known_args(args)[0]
+    if all_args.use_early_stop and not all_args.use_eval:
+        parser.error("--use-early-stop 必须同时设置 --use-eval")
     return all_args
 
 
