@@ -3,6 +3,7 @@ import numpy as np
 from typing import Union, List
 from abc import ABC, abstractmethod
 from .utils import get_shape_from_space
+from .temporal_attention import get_policy_state_shape
 
 """
 这个文件是强化学习经验回放缓冲区的实现,专门用于PPO算法训练过程中的数据存储和管理
@@ -52,6 +53,7 @@ class ReplayBuffer(Buffer):
 
         obs_shape = get_shape_from_space(obs_space)
         act_shape = get_shape_from_space(act_space)
+        state_shape = get_policy_state_shape(args, obs_space)
 
         # (o_0, a_0, r_0, d_1, o_1, ... , d_T, o_T)
         self.obs = np.zeros((self.buffer_size + 1, self.n_rollout_threads, self.num_agents, *obs_shape), dtype=np.float32)
@@ -69,7 +71,7 @@ class ReplayBuffer(Buffer):
         self.returns = np.zeros((self.buffer_size + 1, self.n_rollout_threads, self.num_agents, 1), dtype=np.float32)
         # rnn
         self.rnn_states_actor = np.zeros((self.buffer_size + 1, self.n_rollout_threads, self.num_agents,
-                                          self.recurrent_hidden_layers, self.recurrent_hidden_size), dtype=np.float32)
+                                          *state_shape), dtype=np.float32)
         self.rnn_states_critic = np.zeros_like(self.rnn_states_actor)
 
         self.step = 0
@@ -171,6 +173,27 @@ class ReplayBuffer(Buffer):
                 for step in reversed(range(self.rewards.shape[0])):
                     self.returns[step] = self.returns[step + 1] * self.gamma * self.masks[step + 1] + self.rewards[step]
                     # self.rewards[step]其实就是即时奖励rt+1
+
+    @staticmethod
+    def feed_forward_generator(buffer, num_mini_batch):
+        """按时刻采样；注意力的原始窗口已随状态保存，含上个 rollout 的合法前缀。"""
+        buffers = [buffer] if isinstance(buffer, ReplayBuffer) else buffer
+        fields = ("obs", "actions", "masks", "action_log_probs", "advantages", "returns",
+                  "value_preds", "rnn_states_actor", "rnn_states_critic")
+        data = []
+        for name in fields:
+            arrays = []
+            for buf in buffers:
+                values = getattr(buf, name)
+                if name in {"obs", "masks", "returns", "value_preds", "rnn_states_actor", "rnn_states_critic"}:
+                    values = values[:-1]
+                arrays.append(values.reshape(-1, *values.shape[3:]))
+            data.append(np.concatenate(arrays))
+        batch_size = len(data[0])
+        if not 1 <= num_mini_batch <= batch_size:
+            raise ValueError("mini-batch 数量必须介于 1 与采样时刻总数之间")
+        for indices in np.array_split(torch.randperm(batch_size).numpy(), num_mini_batch):
+            yield tuple(values[indices] for values in data)
 
     @staticmethod
     def recurrent_generator(buffer: Union[Buffer, List[Buffer]], num_mini_batch: int, data_chunk_length: int):

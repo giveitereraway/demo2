@@ -3,6 +3,7 @@ import torch.nn as nn
 
 from ..utils.mlp import MLPBase
 from ..utils.gru import GRULayer
+from ..utils.temporal_attention import TemporalAttention, get_memory_encoder, get_policy_state_shape
 from ..utils.act import ACTLayer
 from ..utils.utils import check
 
@@ -16,13 +17,16 @@ class PPOActor(nn.Module):
         self.act_hidden_size = args.act_hidden_size
         self.activation_id = args.activation_id
         self.use_feature_normalization = args.use_feature_normalization
-        self.use_recurrent_policy = args.use_recurrent_policy
+        self.memory_encoder = get_memory_encoder(args)
+        self.use_recurrent_policy = self.memory_encoder == "gru"
+        self.state_shape = get_policy_state_shape(args, obs_space)
         self.recurrent_hidden_size = args.recurrent_hidden_size
         self.recurrent_hidden_layers = args.recurrent_hidden_layers
         self.tpdv = dict(dtype=torch.float32, device=device)
         self.use_prior = args.use_prior
         # (1) feature extraction module 特征提取网络，把原始观测转为高维特征 activation_id默认为1
-        self.base = MLPBase(obs_space, self.hidden_size, self.activation_id, self.use_feature_normalization)
+        self.base = (TemporalAttention(args, obs_space) if self.memory_encoder == "temporal_attention"
+                     else MLPBase(obs_space, self.hidden_size, self.activation_id, self.use_feature_normalization))
         input_size = self.base.output_size
         # (2) rnn module 可选的GRU网络，把高维特征转化为低维特征
         if self.use_recurrent_policy: # use_recurrent_policy 默认为True
@@ -50,7 +54,10 @@ class PPOActor(nn.Module):
             alpha0[distance<=8000] = 10 # 原本是10 95最佳
             beta0[attack_angle<=45] = 6
             beta0[attack_angle<=22.5] = 3
-        actor_features = self.base(obs) # 首先经过MLP层
+        if self.memory_encoder == "temporal_attention":
+            actor_features, rnn_states = self.base(obs, rnn_states, masks)
+        else:
+            actor_features = self.base(obs)
 
         if self.use_recurrent_policy: # 然后经过GRU层（可选）
             actor_features, rnn_states = self.rnn(actor_features, rnn_states, masks)
@@ -84,7 +91,10 @@ class PPOActor(nn.Module):
         if active_masks is not None:
             active_masks = check(active_masks).to(**self.tpdv)
 
-        actor_features = self.base(obs)
+        if self.memory_encoder == "temporal_attention":
+            actor_features, rnn_states = self.base(obs, rnn_states, masks)
+        else:
+            actor_features = self.base(obs)
 
         if self.use_recurrent_policy:
             actor_features, rnn_states = self.rnn(actor_features, rnn_states, masks)

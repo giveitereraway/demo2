@@ -80,6 +80,13 @@ def parse_args(args, parser):
     group.add_argument('--render-mode', type=str, default='txt',
                        help="txt or real_time")
     all_args = parser.parse_known_args(args)[0]
+    from algorithms.utils.temporal_attention import get_memory_encoder
+    try:
+        encoder = get_memory_encoder(all_args)
+        if encoder == "temporal_attention" and all_args.env_name not in {"SingleControl", "SingleCombat"}:
+            raise ValueError("时序注意力仅支持 SingleControl 和 SingleCombat 的 PPO 场景")
+    except ValueError as error:
+        parser.error(str(error))
     if all_args.use_early_stop and not all_args.use_eval:
         parser.error("--use-early-stop 必须同时设置 --use-eval")
     return all_args

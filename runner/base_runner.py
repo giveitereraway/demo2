@@ -122,6 +122,8 @@ class Runner(object):
         self.save_checkpoint("latest")
 
     def save_checkpoint(self, tag):
+        if hasattr(self.policy, "save_model_config"):
+            self.policy.save_model_config(self.save_dir)
         torch.save(self.policy.actor.state_dict(), os.path.join(self.save_dir, f"actor_{tag}.pt"))
         torch.save(self.policy.critic.state_dict(), os.path.join(self.save_dir, f"critic_{tag}.pt"))
 
@@ -148,6 +150,8 @@ class Runner(object):
         return should_stop
 
     def restore(self):
+        if hasattr(self.policy, "validate_model_config"):
+            self.policy.validate_model_config(self.model_dir)
         policy_actor_state_dict = torch.load(str(self.model_dir) + '/actor_latest.pt')
         self.policy.actor.load_state_dict(policy_actor_state_dict)
         policy_critic_state_dict = torch.load(str(self.model_dir) + '/critic_latest.pt')

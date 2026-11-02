@@ -3,6 +3,7 @@ import torch.nn as nn
 
 from ..utils.mlp import MLPBase, MLPLayer
 from ..utils.gru import GRULayer
+from ..utils.temporal_attention import TemporalAttention, get_memory_encoder, get_policy_state_shape
 from ..utils.utils import check
 
 
@@ -14,12 +15,15 @@ class PPOCritic(nn.Module):
         self.act_hidden_size = args.act_hidden_size
         self.activation_id = args.activation_id
         self.use_feature_normalization = args.use_feature_normalization
-        self.use_recurrent_policy = args.use_recurrent_policy
+        self.memory_encoder = get_memory_encoder(args)
+        self.use_recurrent_policy = self.memory_encoder == "gru"
+        self.state_shape = get_policy_state_shape(args, obs_space)
         self.recurrent_hidden_size = args.recurrent_hidden_size
         self.recurrent_hidden_layers = args.recurrent_hidden_layers
         self.tpdv = dict(dtype=torch.float32, device=device)
         # (1) feature extraction module
-        self.base = MLPBase(obs_space, self.hidden_size, self.activation_id, self.use_feature_normalization)
+        self.base = (TemporalAttention(args, obs_space) if self.memory_encoder == "temporal_attention"
+                     else MLPBase(obs_space, self.hidden_size, self.activation_id, self.use_feature_normalization))
         # (2) rnn module
         input_size = self.base.output_size
         if self.use_recurrent_policy:
@@ -28,6 +32,7 @@ class PPOCritic(nn.Module):
         # (3) value module
         if len(self.act_hidden_size) > 0:
             self.mlp = MLPLayer(input_size, self.act_hidden_size, self.activation_id)
+            input_size = self.mlp.output_size
         self.value_out = nn.Linear(input_size, 1)
 
         self.to(device)
@@ -37,7 +42,10 @@ class PPOCritic(nn.Module):
         rnn_states = check(rnn_states).to(**self.tpdv)
         masks = check(masks).to(**self.tpdv)
 
-        critic_features = self.base(obs)
+        if self.memory_encoder == "temporal_attention":
+            critic_features, rnn_states = self.base(obs, rnn_states, masks)
+        else:
+            critic_features = self.base(obs)
 
         if self.use_recurrent_policy:
             critic_features, rnn_states = self.rnn(critic_features, rnn_states, masks)

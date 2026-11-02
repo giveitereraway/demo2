@@ -181,6 +181,9 @@ class SelfplayJSBSimRunner(JSBSimRunner):
             # [Selfplay] Reset obs, masks, rnn_states
             opponent_obs = obs[:, self.num_agents // 2:, ...]
             obs = obs[:, :self.num_agents // 2, ...]
+            # 仅在新回合第一帧清空历史，后续帧恢复记忆；双方分别维护 mask。
+            masks.fill(1)
+            opponent_masks.fill(1)
             masks[dones_env == True] = np.zeros(((dones_env == True).sum(), *masks.shape[1:]), dtype=np.float32)
             rnn_states[dones_env == True] = np.zeros(((dones_env == True).sum(), *rnn_states.shape[1:]), dtype=np.float32)
 

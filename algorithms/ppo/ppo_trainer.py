@@ -3,6 +3,7 @@ import torch.nn as nn
 from typing import Union, List
 from .ppo_policy import PPOPolicy
 from ..utils.buffer import ReplayBuffer
+from ..utils.temporal_attention import get_memory_encoder
 from ..utils.utils import check, get_gard_norm
 
 
@@ -21,7 +22,7 @@ class PPOTrainer():
         self.use_max_grad_norm = args.use_max_grad_norm
         self.max_grad_norm = args.max_grad_norm
         # rnn configs
-        self.use_recurrent_policy = args.use_recurrent_policy
+        self.use_recurrent_policy = get_memory_encoder(args) == "gru"
         self.data_chunk_length = args.data_chunk_length
 
     def ppo_update(self, policy: PPOPolicy, sample):
@@ -88,7 +89,7 @@ class PPOTrainer():
             if self.use_recurrent_policy:
                 data_generator = ReplayBuffer.recurrent_generator(buffer, self.num_mini_batch, self.data_chunk_length)
             else:
-                raise NotImplementedError
+                data_generator = ReplayBuffer.feed_forward_generator(buffer, self.num_mini_batch)
 
             for sample in data_generator:
 
