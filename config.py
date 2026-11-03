@@ -294,6 +294,14 @@ def _get_eval_config(parser: argparse.ArgumentParser):
                        help="time duration between contiunous twice evaluation progress. (default 25)")
     group.add_argument("--eval-episodes", type=int, default=32,
                        help="number of episodes of a single evaluation. (default 32)")
+    group.add_argument("--heading-first-target", action="store_true",
+                       help="在 heading 验证中保存首次达到跟踪门槛的模型")
+    group.add_argument("--heading-error-limits", type=float, nargs=3, default=(10, 100, 24),
+                       metavar=("DEG", "M", "MPS"), help="航向、高度、纵向速度误差上限")
+    group.add_argument("--heading-target-pass-rate", type=float, default=0.9,
+                       help="达到跟踪门槛所需的验证回合通过率")
+    group.add_argument("--heading-target-eval-seed", type=int, default=2026,
+                       help="各组和各次验证共享的场景种子")
     group.add_argument("--use-early-stop", action='store_true', default=False,
                        help="启用早停，必须同时设置 --use-eval")
     group.add_argument("--early-stop-min-steps", type=float, default=None,

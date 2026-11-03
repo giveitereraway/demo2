@@ -100,6 +100,17 @@ class HeadingTask(BaseTask):
         norm_obs = np.clip(norm_obs, self.observation_space.low, self.observation_space.high)
         return norm_obs
 
+    def get_termination(self, env, agent_id, info):
+        if getattr(env, "record_heading_tracking", False):
+            aircraft = env.agents[agent_id]
+            if (aircraft.get_property_value(c.simulation_sim_time_sec)
+                    >= aircraft.get_property_value(c.heading_check_time)
+                    or env.current_step >= self.config.max_steps):
+                # 在终止条件可能更换目标前，记录当前目标的物理量误差。
+                info["heading_tracking_errors"] = aircraft.get_property_values(
+                    [c.delta_heading, c.delta_altitude, c.delta_velocities_u])
+        return super().get_termination(env, agent_id, info)
+
     def normalize_action(self, env, agent_id, action):
         """Convert discrete action index into continuous value.
         """

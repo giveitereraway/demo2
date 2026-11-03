@@ -1,8 +1,10 @@
+import json
 import time
 import torch
 import logging
 import numpy as np
 from typing import List
+from pathlib import Path
 from .base_runner import Runner, ReplayBuffer
 
 
@@ -93,7 +95,9 @@ class JSBSimRunner(Runner):
 
             # eval
             should_stop = False
-            if self.use_eval and ((episode % self.eval_interval == 0 and episode != 0) or episode == episodes - 1):
+            eval_update = episode + 1 if getattr(self.all_args, "heading_first_target", False) else episode
+            if self.use_eval and ((eval_update % self.eval_interval == 0 and eval_update != 0)
+                                  or episode == episodes - 1):
                 # 短训练也评估最后模型；自博弈首次评估前需有可加载的对手快照。
                 if self.use_selfplay and not self.policy_pool:
                     self.save(episode)
@@ -149,7 +153,18 @@ class JSBSimRunner(Runner):
         total_episodes, eval_episode_rewards = 0, []
         eval_cumulative_rewards = np.zeros((self.n_eval_rollout_threads, *self.buffer.rewards.shape[2:]), dtype=np.float32)
 
-        eval_obs = self.eval_envs.reset()
+        tracking = getattr(self.all_args, "heading_first_target", False)
+        if tracking:
+            seed = self.all_args.heading_target_eval_seed
+            ranks = np.arange(self.n_eval_rollout_threads)
+            # 每个环境的回合配额固定，避免按完成先后选择验证场景。
+            remaining = (self.eval_episodes + self.n_eval_rollout_threads - 1 - ranks) // self.n_eval_rollout_threads
+            episode_ok = np.ones(self.n_eval_rollout_threads, dtype=bool)
+            passed = 0
+            limits = np.asarray(self.all_args.heading_error_limits)
+            eval_obs = self.eval_envs.reset(seeds=[seed + int(rank) for rank in ranks])
+        else:
+            eval_obs = self.eval_envs.reset()
         eval_masks = np.ones((self.n_eval_rollout_threads, *self.buffer.masks.shape[2:]), dtype=np.float32)
         eval_rnn_states = np.zeros((self.n_eval_rollout_threads, *self.buffer.rnn_states_actor.shape[2:]), dtype=np.float32)
 
@@ -190,8 +205,20 @@ class JSBSimRunner(Runner):
             
             eval_cumulative_rewards += eval_rewards
             eval_dones_env = np.all(eval_dones.squeeze(axis=-1), axis=-1)
-            total_episodes += np.sum(eval_dones_env)
-            eval_episode_rewards.append(eval_cumulative_rewards[eval_dones_env == True])
+            counted_dones = eval_dones_env
+            if tracking:
+                counted_dones = eval_dones_env & (remaining > 0)
+                for rank, info in enumerate(eval_infos):
+                    errors = info.get("heading_tracking_errors")
+                    if errors is not None:
+                        episode_ok[rank] &= bool(np.all(np.abs(errors) <= limits))
+                    if counted_dones[rank]:
+                        passed += int(episode_ok[rank] and errors is not None
+                                      and info.get("heading_tracking_timeout", False))
+                remaining[counted_dones] -= 1
+                episode_ok[eval_dones_env] = True
+            total_episodes += np.sum(counted_dones)
+            eval_episode_rewards.append(eval_cumulative_rewards[counted_dones])
             eval_cumulative_rewards[eval_dones_env == True] = 0
 
             eval_masks = np.ones_like(eval_masks, dtype=np.float32)
@@ -199,11 +226,44 @@ class JSBSimRunner(Runner):
             eval_rnn_states[eval_dones_env == True] = np.zeros(((eval_dones_env == True).sum(), *eval_rnn_states.shape[1:]), dtype=np.float32)
 
         eval_infos = {}
+        if tracking:
+            eval_infos["heading_tracking_pass_rate"] = passed / self.eval_episodes
+            self.record_heading_first_target(total_num_steps, passed)
         eval_infos['eval_average_episode_rewards'] = np.concatenate(eval_episode_rewards).mean(axis=1)  # shape: [num_agents, 1]
         logging.info(" eval average episode rewards: " + str(np.mean(eval_infos['eval_average_episode_rewards'])))
         self.log_info(eval_infos, total_num_steps)
         logging.info("...End evaluation")
         return float(np.mean(eval_infos['eval_average_episode_rewards']))
+
+    def record_heading_first_target(self, total_num_steps, passed):
+        args = self.all_args
+        pass_rate = passed / self.eval_episodes
+        logging.info("heading 跟踪验证：步数 %d，通过 %d/%d，要求 %.1f%%",
+                     total_num_steps, passed, self.eval_episodes, 100 * args.heading_target_pass_rate)
+        path = Path(self.save_dir) / "heading_first_target.json"
+        if path.exists() and json.loads(path.read_text(encoding="utf-8"))["first_env_steps"] is not None:
+            return
+        reached = pass_rate >= args.heading_target_pass_rate
+        if reached:
+            self.save_checkpoint("first_tracking_target")
+            logging.info("保存 heading 首次达标模型：训练环境步数 %d", total_num_steps)
+        record = {
+            "first_env_steps": int(total_num_steps) if reached else None,
+            "evaluated_env_steps": int(total_num_steps),
+            "pass_rate": pass_rate,
+            "passed_episodes": passed,
+            "eval_episodes": self.eval_episodes,
+            "eval_seed": args.heading_target_eval_seed,
+            "eval_rollout_threads": self.n_eval_rollout_threads,
+            "eval_interval": self.eval_interval,
+            "error_limits_deg_m_mps": args.heading_error_limits,
+            "required_pass_rate": args.heading_target_pass_rate,
+            "training_seed": args.seed,
+            "policy_loss": args.policy_loss,
+        }
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+        temporary.replace(path)
 
     @torch.no_grad()
     def render(self):

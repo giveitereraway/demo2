@@ -156,7 +156,10 @@ class DummyVecEnv(VecEnv):
         self.actions = None
         return self._flatten(obss), self._flatten(rewards), self._flatten(dones), np.array(infos)
 
-    def reset(self):
+    def reset(self, seeds=None):
+        if seeds is not None:
+            for env, seed in zip(self.envs, seeds):
+                env.seed(seed)
         obss = [env.reset() for env in self.envs]
         return self._flatten(obss)
 
@@ -210,6 +213,9 @@ def worker(remote: Connection, parent_remote: Connection, env_fn_wrappers):
             if cmd == 'step':
                 remote.send([step_env(env, action) for env, action in zip(envs, data)])
             elif cmd == 'reset':
+                if data is not None:
+                    for env, seed in zip(envs, data):
+                        env.seed(seed)
                 remote.send([env.reset() for env in envs])
             elif cmd == 'close':
                 remote.close()
@@ -283,10 +289,11 @@ class SubprocVecEnv(VecEnv):
         obss, rewards, dones, infos = zip(*results)
         return self._flatten(obss), self._flatten(rewards), self._flatten(dones), np.array(infos)
 
-    def reset(self):
+    def reset(self, seeds=None):
         self._assert_not_closed()
-        for remote in self.remotes:
-            remote.send(('reset', None))
+        for index, remote in enumerate(self.remotes):
+            start = index * self.in_series
+            remote.send(('reset', None if seeds is None else seeds[start:start + self.in_series]))
         obss = [remote.recv() for remote in self.remotes]
         obss = self._flatten_series(obss)
         return self._flatten(obss)

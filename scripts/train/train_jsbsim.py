@@ -14,6 +14,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath
 from config import get_config
 from runner.share_jsbsim_runner import ShareJSBSimRunner
 from envs.JSBSim.envs import SingleCombatEnv, SingleControlEnv, MultipleCombatEnv
+from envs.JSBSim.envs.singlecontrol_env import HeadingTrackingEvalEnv
 from envs.env_wrappers import SubprocVecEnv, DummyVecEnv, ShareSubprocVecEnv, ShareDummyVecEnv
 from runner.tacview import Tacview
 
@@ -52,7 +53,8 @@ def make_eval_env(all_args):
             if all_args.env_name == "SingleCombat":
                 env = SingleCombatEnv(all_args.scenario_name)
             elif all_args.env_name == "SingleControl":
-                env = SingleControlEnv(all_args.scenario_name)
+                env_type = HeadingTrackingEvalEnv if all_args.heading_first_target else SingleControlEnv
+                env = env_type(all_args.scenario_name)
             elif all_args.env_name == "MultipleCombat":
                 env = MultipleCombatEnv(all_args.scenario_name)
             else:
@@ -92,6 +94,17 @@ def parse_args(args, parser):
         parser.error(str(error))
     if all_args.use_early_stop and not all_args.use_eval:
         parser.error("--use-early-stop 必须同时设置 --use-eval")
+    if all_args.heading_first_target:
+        if (all_args.env_name, all_args.scenario_name) != ("SingleControl", "1/heading") or all_args.use_selfplay:
+            parser.error("--heading-first-target 仅支持 SingleControl / 1/heading")
+        if not all_args.use_eval or all_args.use_early_stop:
+            parser.error("--heading-first-target 需要 --use-eval，且不能与 --use-early-stop 同时使用")
+        if not all(np.isfinite(limit) and limit > 0 for limit in all_args.heading_error_limits):
+            parser.error("--heading-error-limits 需要三个有限正数")
+        if not 0 < all_args.heading_target_pass_rate <= 1 or all_args.heading_target_eval_seed < 0:
+            parser.error("达标率须在 (0, 1] 内，验证种子须为非负整数")
+        if min(all_args.eval_episodes, all_args.n_eval_rollout_threads, all_args.eval_interval) < 1:
+            parser.error("验证回合数、线程数和间隔须为正数")
     return all_args
 
 

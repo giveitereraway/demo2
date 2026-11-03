@@ -1,3 +1,4 @@
+import numpy as np
 from envs.JSBSim.human_task.HumanFreeFlyTask import HumanFreeFlyTask
 from .env_base import BaseEnv
 from ..tasks.heading_task import HeadingTask
@@ -48,3 +49,17 @@ class SingleControlEnv(BaseEnv):
         for idx, sim in enumerate(self.agents.values()):
             sim.reload(self.init_states[idx])
         self._tempsims.clear()
+
+
+class HeadingTrackingEvalEnv(SingleControlEnv):
+    record_heading_tracking = True
+
+    def seed(self, seed=None):
+        seeds = super().seed(seed)
+        self.episode_seeds = np.random.default_rng(seeds[0])
+        return seeds
+
+    def reset(self):
+        # 每回合独立取种子，前一回合提前结束也不会改变后续场景。
+        super().seed(int(self.episode_seeds.integers(2**32)))
+        return super().reset()

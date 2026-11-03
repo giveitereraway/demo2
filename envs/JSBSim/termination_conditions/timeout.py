@@ -25,6 +25,8 @@ class Timeout(BaseTerminationCondition):
         """
         done = env.current_step >= self.max_steps
         if done:
+            if getattr(env, "record_heading_tracking", False):
+                info["heading_tracking_timeout"] = True
             self.log(f"{agent_id} step limits! Total Steps={env.current_step}")
         success = False
         return done, success, info
