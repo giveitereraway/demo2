@@ -80,6 +80,9 @@ def parse_args(args, parser):
     group.add_argument('--render-mode', type=str, default='txt',
                        help="txt or real_time")
     all_args = parser.parse_known_args(args)[0]
+    if all_args.policy_loss == "spo" and (all_args.algorithm_name != "ppo"
+            or all_args.env_name not in {"SingleControl", "SingleCombat"}):
+        parser.error("SPO 仅支持 SingleControl / SingleCombat 的 PPO 训练，暂不支持 MAPPO / MultipleCombat")
     from algorithms.utils.temporal_attention import get_memory_encoder
     try:
         encoder = get_memory_encoder(all_args)

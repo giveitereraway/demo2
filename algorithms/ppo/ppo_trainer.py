@@ -1,3 +1,6 @@
+import math
+
+import numpy as np
 import torch
 import torch.nn as nn
 from typing import Union, List
@@ -15,6 +18,11 @@ class PPOTrainer():
         # ppo config
         self.ppo_epoch = args.ppo_epoch
         self.clip_param = args.clip_param
+        self.policy_loss = getattr(args, "policy_loss", "clip")
+        if self.policy_loss not in {"clip", "spo"}:
+            raise ValueError("--policy-loss 只支持 clip 或 spo")
+        if self.policy_loss == "spo" and (not math.isfinite(self.clip_param) or self.clip_param <= 0):
+            raise ValueError("SPO 要求 --clip-param 为有限正数")
         self.use_clipped_value_loss = args.use_clipped_value_loss
         self.num_mini_batch = args.num_mini_batch
         self.value_loss_coef = args.value_loss_coef
@@ -44,10 +52,20 @@ class PPOTrainer():
                                                                          masks_batch)
 
         # Obtain the loss function loss=策略损失+价值损失+熵损失
+        # 完整动作的联合 log probability 必须保持 [batch, 1]，避免意外广播。
+        if (action_log_probs.ndim != 2 or action_log_probs.shape[-1] != 1
+                or action_log_probs.shape != old_action_log_probs_batch.shape
+                or action_log_probs.shape != advantages_batch.shape):
+            raise ValueError("新旧动作 log probability 和优势必须同为 [batch, 1]")
         ratio = torch.exp(action_log_probs - old_action_log_probs_batch) # 新旧策略比
         surr1 = ratio * advantages_batch # 概率比乘以优势函数
-        surr2 = torch.clamp(ratio, 1.0 - self.clip_param, 1.0 + self.clip_param) * advantages_batch # 限制
-        policy_loss = torch.sum(torch.min(surr1, surr2), dim=-1, keepdim=True)
+        if self.policy_loss == "spo":
+            # Xie 等，Simple Policy Optimization，ICML 2025，公式 (16)。
+            surrogate = surr1 - advantages_batch.abs() / (2 * self.clip_param) * (ratio - 1).square()
+        else:
+            surr2 = torch.clamp(ratio, 1.0 - self.clip_param, 1.0 + self.clip_param) * advantages_batch
+            surrogate = torch.min(surr1, surr2)
+        policy_loss = torch.sum(surrogate, dim=-1, keepdim=True)
         policy_loss = -policy_loss.mean()
 
         if self.use_clipped_value_loss:
@@ -84,6 +102,9 @@ class PPOTrainer():
         train_info['actor_grad_norm'] = 0
         train_info['critic_grad_norm'] = 0
         train_info['ratio'] = 0
+        train_info['ratio_deviation'] = 0
+        train_info['approx_kl'] = 0
+        train_info['ratio_out_of_bounds'] = 0
 
         for _ in range(self.ppo_epoch):
             if self.use_recurrent_policy:
@@ -102,10 +123,24 @@ class PPOTrainer():
                 train_info['actor_grad_norm'] += actor_grad_norm
                 train_info['critic_grad_norm'] += critic_grad_norm
                 train_info['ratio'] += ratio.mean().item()
+                with torch.no_grad():
+                    train_info['ratio_deviation'] += (ratio - 1).abs().mean().item()
+                    train_info['approx_kl'] += ((ratio - 1) - ratio.log()).mean().item()
+                    train_info['ratio_out_of_bounds'] += (
+                        (ratio < 1 - self.clip_param) | (ratio > 1 + self.clip_param)
+                    ).float().mean().item()
 
         num_updates = self.ppo_epoch * self.num_mini_batch
 
         for k in train_info.keys():
             train_info[k] /= num_updates
+
+        # 使用 rollout 时的价值预测；回报无方差时解释方差没有定义，记录 NaN。
+        buffers = [buffer] if isinstance(buffer, ReplayBuffer) else buffer
+        returns = np.concatenate([b.returns[:-1].reshape(-1) for b in buffers])
+        predictions = np.concatenate([b.value_preds[:-1].reshape(-1) for b in buffers])
+        return_variance = np.var(returns)
+        train_info['explained_variance'] = float(1 - np.var(returns - predictions) / return_variance) \
+            if return_variance > 0 else float('nan')
 
         return train_info

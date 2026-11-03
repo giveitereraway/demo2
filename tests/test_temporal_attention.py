@@ -78,13 +78,14 @@ def test_causal_prefix_is_unchanged_by_future_observations():
     assert not torch.allclose(before[4:], after[4:])
 
 
+@pytest.mark.parametrize("policy_loss", ["clip", "spo"])
 @pytest.mark.parametrize("act_space", [gym.spaces.Discrete(12),
     gym.spaces.MultiDiscrete([41, 41, 41, 30]),
     gym.spaces.Tuple([gym.spaces.Discrete(12), gym.spaces.Discrete(2)])])
-def test_rollout_prefix_probability_ratio_and_update(act_space):
+def test_rollout_prefix_probability_ratio_and_update(act_space, policy_loss):
     """H 大于 rollout 长度；覆盖跨 rollout、独立环境/飞机和回合中途重置。"""
     torch.manual_seed(9)
-    args = attention_args()
+    args = attention_args(policy_loss=policy_loss)
     space = gym.spaces.Box(-100, 100, shape=(15,))
     policy = PPOPolicy(args, space, act_space)
     buffer = ReplayBuffer(args, 2, space, act_space)
@@ -130,7 +131,8 @@ def test_rollout_prefix_probability_ratio_and_update(act_space):
     assert next(policy.actor.base.parameters()) is not next(policy.critic.base.parameters())
 
 
-def test_mlp_training_and_legacy_gru_checkpoint():
+@pytest.mark.parametrize("policy_loss", ["clip", "spo"])
+def test_mlp_training_and_legacy_gru_checkpoint(policy_loss):
     space, action = gym.spaces.Box(-1, 1, shape=(15,)), gym.spaces.Discrete(12)
     legacy_args = get_config().parse_args([])
     legacy = PPOPolicy(legacy_args, space, action)
@@ -138,9 +140,10 @@ def test_mlp_training_and_legacy_gru_checkpoint():
     explicit.actor.load_state_dict(legacy.actor.state_dict(), strict=True)
     explicit.critic.load_state_dict(legacy.critic.state_dict(), strict=True)
     assert get_memory_encoder(legacy_args) == "gru"
-    args = attention_args(memory_encoder="mlp")
+    args = attention_args(memory_encoder="mlp", policy_loss=policy_loss)
     policy = PPOPolicy(args, space, action)
     info = PPOTrainer(args).train(policy, ReplayBuffer(args, 1, space, action))
+    assert np.isnan(info.pop("explained_variance"))  # 全零回报的解释方差没有定义。
     assert all(np.isfinite(value) for value in info.values())
     assert not hasattr(policy.actor, "rnn")
 
@@ -189,13 +192,14 @@ def test_attention_training_entry_rejects_multiple_combat(capsys):
     assert "仅支持 SingleControl 和 SingleCombat" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize("policy_loss", ["clip", "spo"])
 @pytest.mark.parametrize("env_name,scenario_name,selfplay,width", [
     ("SingleCombat", "1v1/NoWeapon/Selfplay", False, 64),
     ("SingleCombat", "1v1/NoWeapon/Selfplay", True, 64),
     ("SingleControl", "1/heading", False, 64),
     ("SingleControl", "1/heading", False, 128),
 ])
-def test_attention_jsbsim_training_evaluation_and_restore(tmp_path, env_name, scenario_name, selfplay, width, monkeypatch):
+def test_attention_jsbsim_training_evaluation_and_restore(tmp_path, env_name, scenario_name, selfplay, width, monkeypatch, policy_loss):
     """真实飞行仿真闭环：两次更新、跨回合评估、保存/恢复和换对手清空。"""
     from envs.JSBSim.envs import SingleCombatEnv, SingleControlEnv
     from envs.env_wrappers import DummyVecEnv
@@ -203,7 +207,7 @@ def test_attention_jsbsim_training_evaluation_and_restore(tmp_path, env_name, sc
     from runner.selfplay_jsbsim_runner import SelfplayJSBSimRunner
 
     torch.set_num_threads(1)
-    args = attention_args(n_rollout_threads=1, num_env_steps=8, buffer_size=4, history_length=16,
+    args = attention_args(policy_loss=policy_loss, n_rollout_threads=1, num_env_steps=8, buffer_size=4, history_length=16,
                           attention_hidden_size=width,
                           use_selfplay=selfplay, n_choose_opponents=1, use_eval=True,
                           n_eval_rollout_threads=1, eval_episodes=2, eval_interval=1)

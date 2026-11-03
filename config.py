@@ -204,10 +204,12 @@ def _get_ppo_config(parser: argparse.ArgumentParser):
             max norm of gradients (default: 0.5)
     """
     group = parser.add_argument_group("PPO parameters")
+    group.add_argument("--policy-loss", choices=["clip", "spo"], default="clip",
+                       help="PPO 策略目标：clip 为原始 PPO，spo 为优势加权二次惩罚（限 SingleControl / SingleCombat）")
     group.add_argument("--ppo-epoch", type=int, default=10,
                        help='number of ppo epochs (default: 10)')
     group.add_argument("--clip-param", type=float, default=0.2,
-                       help='ppo clip parameter (default: 0.2)')
+                       help='PPO 截断幅度 / SPO 的 epsilon（SPO 要求为有限正数，默认 0.2）')
     group.add_argument("--use-clipped-value-loss", action='store_true', default=False,
                        help="By default false. If set, clip value loss.")
     group.add_argument("--num-mini-batch", type=int, default=1,
