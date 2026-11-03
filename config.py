@@ -302,12 +302,6 @@ def _get_eval_config(parser: argparse.ArgumentParser):
                        help="达到跟踪门槛所需的验证回合通过率")
     group.add_argument("--heading-target-eval-seed", type=int, default=2026,
                        help="各组和各次验证共享的场景种子")
-    group.add_argument("--use-early-stop", action='store_true', default=False,
-                       help="启用早停，必须同时设置 --use-eval")
-    group.add_argument("--early-stop-min-steps", type=float, default=None,
-                       help="开始累计无提升次数的最低环境步数，默认总训练步数预算的 20%%")
-    group.add_argument("--early-stop-patience", type=int, default=10,
-                       help="达到最低训练量后，连续多少次验证无提升时早停（默认 10）")
     return parser
 
 def _get_render_config(parser: argparse.ArgumentParser):

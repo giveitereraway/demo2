@@ -92,13 +92,11 @@ def parse_args(args, parser):
             raise ValueError("时序注意力仅支持 SingleControl 和 SingleCombat 的 PPO 场景")
     except ValueError as error:
         parser.error(str(error))
-    if all_args.use_early_stop and not all_args.use_eval:
-        parser.error("--use-early-stop 必须同时设置 --use-eval")
     if all_args.heading_first_target:
         if (all_args.env_name, all_args.scenario_name) != ("SingleControl", "1/heading") or all_args.use_selfplay:
             parser.error("--heading-first-target 仅支持 SingleControl / 1/heading")
-        if not all_args.use_eval or all_args.use_early_stop:
-            parser.error("--heading-first-target 需要 --use-eval，且不能与 --use-early-stop 同时使用")
+        if not all_args.use_eval:
+            parser.error("--heading-first-target 需要 --use-eval")
         if not all(np.isfinite(limit) and limit > 0 for limit in all_args.heading_error_limits):
             parser.error("--heading-error-limits 需要三个有限正数")
         if not 0 < all_args.heading_target_pass_rate <= 1 or all_args.heading_target_eval_seed < 0:

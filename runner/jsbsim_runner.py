@@ -94,7 +94,6 @@ class JSBSimRunner(Runner):
                 self.log_info(train_infos, self.total_num_steps)
 
             # eval
-            should_stop = False
             eval_update = episode + 1 if getattr(self.all_args, "heading_first_target", False) else episode
             if self.use_eval and ((eval_update % self.eval_interval == 0 and eval_update != 0)
                                   or episode == episodes - 1):
@@ -102,13 +101,11 @@ class JSBSimRunner(Runner):
                 if self.use_selfplay and not self.policy_pool:
                     self.save(episode)
                 eval_reward = self.eval(self.total_num_steps)
-                should_stop = self.check_early_stopping(eval_reward, self.total_num_steps)
+                self.update_eval_checkpoint(eval_reward, episode)
 
             # save model
-            if (episode % self.save_interval == 0) or (episode == episodes - 1) or should_stop:
+            if (episode % self.save_interval == 0) or (episode == episodes - 1):
                 self.save(episode)
-            if should_stop:
-                break
 
     def warmup(self):
         # reset env

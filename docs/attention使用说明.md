@@ -84,7 +84,7 @@ python scripts/train/train_jsbsim.py --env-name SingleControl --algorithm-name p
 ## 4. 验证与使用边界
 
 ```powershell
-python -m pytest tests/test_temporal_attention.py tests/test_ppo.py tests/test_training_early_stop.py -q
+python -m pytest tests/test_temporal_attention.py tests/test_ppo.py tests/test_eval_checkpoints.py -q
 ```
 
 新测试覆盖 padding、因果前缀、重置与环境隔离、历史观测反传、跨 rollout 的历史、逐步采样与训练概率一致性、零更新概率比约为 1、三种常用动作空间的实际 PPO 更新、旧 GRU 配置兼容和 checkpoint 校验。另有训练入口的支持范围检查，以及真实 JSBSim 的 heading（64/128 维注意力）、1v1 普通/自博弈短闭环；回归测试临时缩短实例回合，不改 YAML 或物理数据。

@@ -116,9 +116,7 @@ class ShareJSBSimRunner(Runner):
             # eval
             if self.use_eval and (episode % self.eval_interval == 0 or episode == episodes - 1):
                 eval_reward = self.eval(self.total_num_steps)
-                if self.check_early_stopping(eval_reward, self.total_num_steps):
-                    self.save(episode)
-                    break
+                self.update_eval_checkpoint(eval_reward, episode)
 
     def warmup(self):
         # reset env

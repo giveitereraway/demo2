@@ -1,5 +1,7 @@
 import torch
 import logging
+import json
+from pathlib import Path
 import numpy as np
 from typing import List
 from .base_runner import Runner, ReplayBuffer
@@ -11,6 +13,11 @@ def _t2n(x):
 
 
 class SelfplayJSBSimRunner(JSBSimRunner):
+
+    def __init__(self, config):
+        self.no_improvement_evals = 0
+        self.convergence_recorded = False
+        super().__init__(config)
 
     def load(self):
         self.use_selfplay = self.all_args.use_selfplay 
@@ -276,6 +283,30 @@ class SelfplayJSBSimRunner(JSBSimRunner):
         # [Selfplay] Reset opponent for the following training
         self.reset_opponent()
         return float(eval_infos['eval_average_episode_rewards'])
+
+    def update_eval_checkpoint(self, eval_reward, episode):
+        improved = super().update_eval_checkpoint(eval_reward, episode)
+        if self.convergence_recorded:
+            return
+        if improved is not False:
+            self.no_improvement_evals = 0
+            return
+        self.no_improvement_evals += 1
+        if self.no_improvement_evals < 10:
+            return
+
+        self.save_checkpoint("converged")
+        record = {
+            "training_round": episode + 1,
+            "total_num_steps": self.total_num_steps,
+            "eval_average_episode_rewards": float(eval_reward),
+            "best_eval_average_episode_rewards": self.best_eval_reward,
+            "no_improvement_evals": self.no_improvement_evals,
+        }
+        path = Path(self.save_dir) / "selfplay_convergence.json"
+        path.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+        self.convergence_recorded = True
+        logging.info("记录首次收敛：训练轮次 %d，步数 %d", episode + 1, self.total_num_steps)
 
     def save(self, episode):
         super().save(episode)

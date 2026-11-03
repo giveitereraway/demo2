@@ -569,6 +569,10 @@ class MixedCatalog(dict):
         Args:
             jsbsim_props (list): list of 'name_jsbsim (access)' of jsbsim properties
         """
+        # 兼容 jsbsim 1.1.x 返回 list、1.2+ 返回整段字符串
+        if isinstance(jsbsim_props, str):
+            jsbsim_props = jsbsim_props.splitlines()
+        
         for jsbsim_prop in jsbsim_props:
             if jsbsim_prop.strip() == "":
                 continue  # skip empty line

@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import sys
 from itertools import count
 from pathlib import Path
@@ -23,7 +24,7 @@ def runner_modules(monkeypatch):
                          ("algorithms.utils.buffer", buffer)]:
         monkeypatch.setitem(sys.modules, name, module)
 
-    package_name = "_early_stop_test_runner"
+    package_name = "_eval_checkpoint_test_runner"
     package = ModuleType(package_name)
     package.__path__ = [str(Path(__file__).resolve().parents[1] / "runner")]
     monkeypatch.setitem(sys.modules, package_name, package)
@@ -44,14 +45,13 @@ def runner_modules(monkeypatch):
 def make_runner(modules, tmp_path, kind="jsbsim_runner", score=None, **overrides):
     args = get_config().parse_args([])
     args.scenario_name = "test"
-    args.use_eval = args.use_early_stop = True
+    args.use_eval = True
     args.use_selfplay = kind == "selfplay_jsbsim_runner"
     args.num_env_steps = 20
     args.buffer_size = args.n_rollout_threads = 1
     args.eval_interval = 2
     args.save_interval = 10
     args.log_interval = 100
-    args.early_stop_patience = 2
     for key, value in overrides.items():
         setattr(args, key, value)
     shared = kind == "share_jsbsim_runner"
@@ -99,71 +99,75 @@ def make_runner(modules, tmp_path, kind="jsbsim_runner", score=None, **overrides
                     "device": "cpu", "render_mode": "txt", "run_dir": tmp_path})
 
 
-def test_defaults_are_opt_in():
-    args = get_config().parse_args([])
-    assert not args.use_early_stop
-    assert args.early_stop_min_steps is None
-    assert args.early_stop_patience == 10
-
-
-def test_minimum_steps_and_improvement_reset(runner_modules, tmp_path):
-    runner = make_runner(runner_modules, tmp_path, early_stop_min_steps=100)
-    assert not runner.check_early_stopping(-10, 10)
-    assert not runner.check_early_stopping(-11, 50)
-    assert not runner.check_early_stopping(-11, 99)
-    assert runner.no_improvement_evals == 0
-    assert not runner.check_early_stopping(-11, 100)
-    assert runner.no_improvement_evals == 1
-    runner.updates = 1
-    assert not runner.check_early_stopping(-9, 101)
-    assert runner.no_improvement_evals == 0
-    assert not runner.check_early_stopping(-9, 102)
-    assert runner.check_early_stopping(-10, 103)
-    assert runner_modules.saved["actor_best.pt"] == {"actor_update": 1}
-    assert runner_modules.saved["critic_best.pt"] == {"critic_update": 1}
-
-
 @pytest.mark.parametrize("reward", [np.nan, np.inf, -np.inf])
-def test_invalid_rewards_do_not_replace_best_or_advance_patience(runner_modules, tmp_path, reward):
-    runner = make_runner(runner_modules, tmp_path, early_stop_min_steps=0)
-    runner.check_early_stopping(10, 1)
-    assert not runner.check_early_stopping(reward, 2)
+def test_invalid_reward_breaks_streak(runner_modules, tmp_path, reward):
+    runner = make_runner(runner_modules, tmp_path, "selfplay_jsbsim_runner")
+    runner.update_eval_checkpoint(10, 0)
+    runner.update_eval_checkpoint(9, 1)
+    assert runner.no_improvement_evals == 1
+    runner.update_eval_checkpoint(reward, 2)
     assert runner.best_eval_reward == 10
     assert runner.no_improvement_evals == 0
 
 
-@pytest.mark.parametrize("options", [
-    {"use_eval": False}, {"early_stop_min_steps": -1}, {"early_stop_patience": 0},
-    {"eval_interval": 0}, {"eval_episodes": 0},
-])
+@pytest.mark.parametrize("options", [{"eval_interval": 0}, {"eval_episodes": 0}])
 def test_invalid_configuration_fails(runner_modules, tmp_path, options):
     with pytest.raises(ValueError):
         make_runner(runner_modules, tmp_path, **options)
 
 
 @pytest.mark.parametrize("kind,selfplay", [
-    ("jsbsim_runner", False), ("selfplay_jsbsim_runner", True),
-    ("share_jsbsim_runner", False), ("share_jsbsim_runner", True),
+    ("jsbsim_runner", False),
+    ("selfplay_jsbsim_runner", True),
+    ("share_jsbsim_runner", False),
+    ("share_jsbsim_runner", True),
 ])
-def test_early_stop_keeps_best_and_final_off_save_interval(runner_modules, tmp_path, kind, selfplay):
-    runner = make_runner(runner_modules, tmp_path, kind, use_selfplay=selfplay)
-    assert runner.early_stop_min_steps == 4
+def test_first_convergence_does_not_stop_training(runner_modules, tmp_path, kind, selfplay):
+    def score(runner):
+        return 20 if runner.updates == 12 else 10
+
+    runner = make_runner(runner_modules, tmp_path, kind, use_selfplay=selfplay,
+                         num_env_steps=24, eval_interval=1, score=score)
     runner.run()
-    assert runner.total_num_steps == 7
-    best_step = runner.evaluated_steps[0]
-    assert runner_modules.saved["actor_best.pt"] == {"actor_update": best_step}
-    assert runner_modules.saved["critic_best.pt"] == {"critic_update": best_step}
-    assert runner_modules.saved["actor_latest.pt"] == {"actor_update": 7}
-    assert runner_modules.saved["critic_latest.pt"] == {"critic_update": 7}
-    if selfplay:
-        assert "actor_6.pt" in runner_modules.saved
+    saved = runner_modules.saved
+    assert runner.total_num_steps == 24
+    assert saved["actor_latest.pt"] == {"actor_update": 24}
+    assert saved["actor_best.pt"] == {"actor_update": 12}
+
+    record_path = tmp_path / "selfplay_convergence.json"
+    if kind == "selfplay_jsbsim_runner":
+        # 第 12 轮创新高，随后第 22 轮首次连续十次无提升。
+        assert saved["actor_converged.pt"] == {"actor_update": 22}
+        assert saved["critic_converged.pt"] == {"critic_update": 22}
+        assert json.loads(record_path.read_text(encoding="utf-8")) == {
+            "training_round": 22,
+            "total_num_steps": 22,
+            "eval_average_episode_rewards": 10,
+            "best_eval_average_episode_rewards": 20,
+            "no_improvement_evals": 10,
+        }
+    else:
+        assert not record_path.exists()
+        assert "actor_converged.pt" not in saved
+
+
+def test_later_improvement_updates_best_but_keeps_first_convergence(runner_modules, tmp_path):
+    runner = make_runner(runner_modules, tmp_path, "selfplay_jsbsim_runner",
+                         num_env_steps=30, eval_interval=1,
+                         score=lambda item: 20 if item.updates == 15 else 10)
+    runner.run()
+    assert runner_modules.saved["actor_converged.pt"] == {"actor_update": 12}
+    assert runner_modules.saved["actor_best.pt"] == {"actor_update": 15}
+    record = json.loads((tmp_path / "selfplay_convergence.json").read_text(encoding="utf-8"))
+    assert record["training_round"] == 12
+    assert record["best_eval_average_episode_rewards"] == 10
 
 
 @pytest.mark.parametrize("kind", ["jsbsim_runner", "selfplay_jsbsim_runner", "share_jsbsim_runner"])
 @pytest.mark.parametrize("budget", [1, 5])
 def test_normal_end_evaluates_and_saves_final_model(runner_modules, tmp_path, kind, budget):
     runner = make_runner(runner_modules, tmp_path, kind, score=lambda item: item.total_num_steps,
-                         num_env_steps=budget, eval_interval=10, use_early_stop=False)
+                         num_env_steps=budget, eval_interval=10)
     runner.run()
     assert runner.evaluated_steps[-1] == budget
     assert runner_modules.saved["actor_best.pt"] == {"actor_update": budget}
@@ -173,7 +177,7 @@ def test_normal_end_evaluates_and_saves_final_model(runner_modules, tmp_path, ki
 
 
 def test_no_evaluation_preserves_training_budget(runner_modules, tmp_path):
-    runner = make_runner(runner_modules, tmp_path, use_eval=False, use_early_stop=False)
+    runner = make_runner(runner_modules, tmp_path, use_eval=False)
     runner.run()
     assert runner.total_num_steps == 20
     assert not runner.evaluated_steps

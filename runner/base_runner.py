@@ -43,20 +43,9 @@ class Runner(object):
         self.eval_interval = self.all_args.eval_interval
         self.eval_episodes = self.all_args.eval_episodes
 
-        # 最低训练量之前也保存最佳模型，但不累计无提升次数。
-        self.use_early_stop = getattr(self.all_args, 'use_early_stop', False)
-        min_steps = getattr(self.all_args, 'early_stop_min_steps', None)
-        self.early_stop_min_steps = int(self.num_env_steps * 0.2 if min_steps is None else min_steps)
-        self.early_stop_patience = getattr(self.all_args, 'early_stop_patience', 10)
-        if self.use_early_stop:
-            if not self.use_eval or self.eval_envs is None:
-                raise ValueError("早停必须开启 --use-eval 并提供验证环境")
-            if self.early_stop_min_steps < 0 or self.early_stop_patience < 1:
-                raise ValueError("早停最低步数必须非负，耐心次数必须大于 0")
         if self.use_eval and (self.eval_interval < 1 or self.eval_episodes < 1):
             raise ValueError("验证间隔和验证回合数必须大于 0")
         self.best_eval_reward = -np.inf
-        self.no_improvement_evals = 0
 
         # dir
         self.model_dir = self.all_args.model_dir
@@ -127,27 +116,18 @@ class Runner(object):
         torch.save(self.policy.actor.state_dict(), os.path.join(self.save_dir, f"actor_{tag}.pt"))
         torch.save(self.policy.critic.state_dict(), os.path.join(self.save_dir, f"critic_{tag}.pt"))
 
-    def check_early_stopping(self, eval_reward, total_num_steps):
-        """按验证平均回合奖励保存最佳模型，并判断是否满足工程早停条件。"""
+    def update_eval_checkpoint(self, eval_reward, episode):
+        """保存验证奖励创新高的模型，返回是否创新高，无效结果返回 None。"""
         eval_reward = float(np.mean(eval_reward))
         if not np.isfinite(eval_reward):
-            logging.warning("验证奖励不是有限值，跳过本次最佳模型和早停判断")
-            return False
+            logging.warning("验证奖励不是有限值，跳过本次 checkpoint 更新")
+            return None
         if eval_reward > self.best_eval_reward:
-            self.best_eval_reward = eval_reward
-            self.no_improvement_evals = 0
             self.save_checkpoint("best")
-            logging.info(f"保存最佳 checkpoint：步数 {total_num_steps}，验证奖励 {eval_reward:.6g}")
-        elif self.use_early_stop and total_num_steps >= self.early_stop_min_steps:
-            self.no_improvement_evals += 1
-
-        should_stop = (self.use_early_stop
-                       and total_num_steps >= self.early_stop_min_steps
-                       and self.no_improvement_evals >= self.early_stop_patience)
-        if should_stop:
-            logging.info(f"触发早停：步数 {total_num_steps}，连续 {self.no_improvement_evals} 次验证无提升，"
-                         f"最佳验证奖励 {self.best_eval_reward:.6g}")
-        return should_stop
+            self.best_eval_reward = eval_reward
+            logging.info("保存最佳 checkpoint：训练轮次 %d，验证奖励 %.6g", episode + 1, eval_reward)
+            return True
+        return False
 
     def restore(self):
         if hasattr(self.policy, "validate_model_config"):
