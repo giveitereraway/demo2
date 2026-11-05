@@ -9,6 +9,50 @@ from runner.jsbsim_runner import JSBSimRunner
 from scripts.train.train_jsbsim import get_config, parse_args
 
 
+@pytest.mark.parametrize("limits,passed", [(["10", "200"], 1), (["10", "200", "24"], 0)])
+def test_heading_optional_speed_limit(tmp_path, monkeypatch, limits, passed):
+    """速度大幅超限时，省略速度门槛仍可按航向和高度的边界值通过。"""
+    args = parse_args([
+        "--env-name", "SingleControl", "--scenario-name", "1/heading",
+        "--use-eval", "--heading-first-target", "--heading-error-limits", *limits,
+        "--eval-episodes", "1", "--n-eval-rollout-threads", "1",
+        "--n-rollout-threads", "1", "--buffer-size", "2",
+    ], get_config())
+    eval_env = HeadingTrackingEvalEnv("1/heading")
+    eval_env.config.max_steps = 2
+    eval_env.task.termination_conditions[-1].max_steps = 2
+    original_step = eval_env.step
+
+    def step(action):
+        obs, rewards, dones, info = original_step(action)
+        info["heading_tracking_errors"] = [10.0, 200.0, 1000.0]
+        return obs, rewards, dones, info
+
+    monkeypatch.setattr(eval_env, "step", step)
+    envs = DummyVecEnv([lambda: SingleControlEnv("1/heading")])
+    eval_envs = DummyVecEnv([lambda: eval_env])
+    try:
+        runner = JSBSimRunner(dict(all_args=args, envs=envs, eval_envs=eval_envs,
+                                   device=torch.device("cpu"), render_mode="txt", run_dir=tmp_path))
+        runner.eval(0)
+        record = json.loads((tmp_path / "heading_first_target.json").read_text())
+        assert record["passed_episodes"] == passed
+        assert record["error_limits_deg_m_mps"] == [float(limit) for limit in limits]
+    finally:
+        eval_envs.close()
+        envs.close()
+
+
+@pytest.mark.parametrize("limits", [["10"], ["10", "200", "24", "1"]])
+def test_heading_rejects_invalid_limit_count(limits):
+    with pytest.raises(SystemExit) as error:
+        parse_args([
+            "--env-name", "SingleControl", "--scenario-name", "1/heading",
+            "--use-eval", "--heading-first-target", "--heading-error-limits", *limits,
+        ], get_config())
+    assert error.value.code == 2
+
+
 @pytest.mark.parametrize("policy_loss", ["clip", "spo"])
 def test_heading_saves_first_target_and_finishes_training(tmp_path, policy_loss):
     args = parse_args([

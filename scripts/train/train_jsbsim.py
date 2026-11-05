@@ -97,8 +97,9 @@ def parse_args(args, parser):
             parser.error("--heading-first-target 仅支持 SingleControl / 1/heading")
         if not all_args.use_eval:
             parser.error("--heading-first-target 需要 --use-eval")
-        if not all(np.isfinite(limit) and limit > 0 for limit in all_args.heading_error_limits):
-            parser.error("--heading-error-limits 需要三个有限正数")
+        if len(all_args.heading_error_limits) not in (2, 3) or not all(
+                np.isfinite(limit) and limit > 0 for limit in all_args.heading_error_limits):
+            parser.error("--heading-error-limits 需要两个或三个有限正数（航向、高度、可选速度）")
         if not 0 < all_args.heading_target_pass_rate <= 1 or all_args.heading_target_eval_seed < 0:
             parser.error("达标率须在 (0, 1] 内，验证种子须为非负整数")
         if min(all_args.eval_episodes, all_args.n_eval_rollout_threads, all_args.eval_interval) < 1:

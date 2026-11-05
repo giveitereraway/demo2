@@ -49,7 +49,7 @@ CUDA_VISIBLE_DEVICES=0 python train/train_jsbsim.py \
     --env-name "$env" --algorithm-name "$algo" --scenario-name "$scenario" --experiment-name "$exp" \
     --seed "$seed" --n-training-threads 1 --n-rollout-threads 32 --cuda \
     --log-interval 1 --save-interval 1 \
-    --use-selfplay --selfplay-algorithm fsp --n-choose-opponents 5 \
+    --use-selfplay --selfplay-algorithm fsp --n-choose-opponents 1 \
     --use-eval --n-eval-rollout-threads 1 --eval-interval 10 --eval-episodes 10 \
     --num-mini-batch 5 --buffer-size 3000 --num-env-steps 2e8 \
     --policy-loss "$policy_loss" \

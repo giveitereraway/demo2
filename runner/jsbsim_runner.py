@@ -208,7 +208,7 @@ class JSBSimRunner(Runner):
                 for rank, info in enumerate(eval_infos):
                     errors = info.get("heading_tracking_errors")
                     if errors is not None:
-                        episode_ok[rank] &= bool(np.all(np.abs(errors) <= limits))
+                        episode_ok[rank] &= bool(np.all(np.abs(errors[:limits.size]) <= limits))
                     if counted_dones[rank]:
                         passed += int(episode_ok[rank] and errors is not None
                                       and info.get("heading_tracking_timeout", False))

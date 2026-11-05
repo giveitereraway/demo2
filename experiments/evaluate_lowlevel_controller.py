@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-独立评估底层航向控制器 actor_heading.pt 的指令跟踪能力。
+独立评估 GRU 或时序注意力低层控制器的指令跟踪能力。
 
 实验会在 SingleControl/heading 环境中手动注入航向、高度、速度目标，
 记录真实跟踪误差、越界率和控制平滑性，结果用于支撑分层架构中
@@ -37,7 +37,7 @@ from gymnasium import spaces
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MODEL_PATH = REPO_ROOT / "scripts/results/SingleControl/1/heading/ppo/v1/wandb/run-20260120_173422-hvmwmud7/files/actor_latest.pt"
 SCENARIO_NAME = "1/heading"
-OUTPUT_DIR = REPO_ROOT / "experiments" / "results" / "lowlevel_heading"
+OUTPUT_DIR = REPO_ROOT / "experiments" / "results" / "chapter_3"
 
 # 主实验指令集：对应分层高层任务常用的底层指令范围。
 COMMAND_ALTITUDE_M = [-100.0, 0.0, 100.0]
@@ -70,7 +70,7 @@ MAX_TARGET_SPEED_MPS = 420.0
 # 固定目标，不让 UnreachHeading 在 30 秒检查点自动切换新目标。
 FIXED_HEADING_CHECK_TIME_SEC = 1_000_000.0
 
-# actor_heading.pt 的网络结构参数，需要和分层任务中的加载方式一致。
+# 无模型配置的旧 GRU 权重使用与分层任务一致的结构参数。
 ACTOR_GAIN = 0.01
 ACTOR_HIDDEN_SIZE = "128 128"
 ACTOR_ACT_HIDDEN_SIZE = "128 128"
@@ -109,9 +109,10 @@ class Command:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="评估 actor_heading.pt 对航向、高度、速度指令的跟踪效果。"
+        description="评估 GRU 或时序注意力模型对航向、高度、速度指令的跟踪效果。"
     )
-    parser.add_argument("--model-path", type=Path, default=MODEL_PATH)
+    parser.add_argument("--model-path", type=Path, default=MODEL_PATH,
+                        help="actor 权重文件，模型配置 model_config.json 与权重放在同一目录。")
     parser.add_argument("--output-dir", type=Path, default=OUTPUT_DIR)
     parser.add_argument("--scenario-name", type=str, default=SCENARIO_NAME)
     parser.add_argument("--horizon-sec", type=float, default=HORIZON_SEC)
@@ -146,12 +147,36 @@ def build_actor(model_path: Path, device: torch.device) -> PPOActor:
     )
     obs_space = spaces.Box(low=-10, high=10.0, shape=(12,))
     act_space = spaces.MultiDiscrete([41, 41, 41, 30])
+    config_path = model_path.with_name("model_config.json")
+    config = json.loads(config_path.read_text(encoding="utf-8")) if config_path.exists() else None
+    if config is not None:
+        if config["observation_space"] != str(obs_space) or config["action_space"] != str(act_space):
+            raise ValueError(f"{config_path} 的观测或动作空间与 Heading 任务不匹配")
+        args.memory_encoder = config["memory_encoder"]
+        args.hidden_size = config["hidden_size"]
+        args.act_hidden_size = config["act_hidden_size"]
+        args.activation_id = config["activation_id"]
+        args.use_feature_normalization = config["use_feature_normalization"]
+        args.use_prior = config["use_prior"]
+        if args.memory_encoder == "gru":
+            args.recurrent_hidden_layers, args.recurrent_hidden_size = config["state_shape"]
+        elif args.memory_encoder == "temporal_attention":
+            args.history_length = config["history_length"]
+            args.attention_hidden_size = config["attention_hidden_size"]
+            args.attention_heads = config["attention_heads"]
+        else:
+            raise ValueError(f"{config_path} 的编码器不受支持：{args.memory_encoder}")
     actor = PPOActor(args, obs_space, act_space, device=device)
+    if config is not None and tuple(config["state_shape"]) != actor.state_shape:
+        raise ValueError(f"{config_path} 的状态尺寸与 actor 不匹配，期望 {actor.state_shape}")
     try:
         state_dict = torch.load(model_path, map_location=device, weights_only=True)
     except TypeError:
         state_dict = torch.load(model_path, map_location=device)
-    actor.load_state_dict(state_dict)
+    try:
+        actor.load_state_dict(state_dict)
+    except RuntimeError as exc:
+        raise RuntimeError(f"无法加载 {model_path}，请核对同目录的 model_config.json 与权重是否匹配") from exc
     actor.eval()
     actor.requires_grad_(False)
     return actor
@@ -382,10 +407,7 @@ def run_trial(
     env.reset()
     target_info = set_command_target(env, command)
 
-    rnn_states = np.zeros(
-        (1, ACTOR_RECURRENT_HIDDEN_LAYERS, ACTOR_RECURRENT_HIDDEN_SIZE),
-        dtype=np.float32,
-    )
+    policy_state = np.zeros((1, *actor.state_shape), dtype=np.float32)
     masks = np.ones((1, 1), dtype=np.float32)
     records: list[dict[str, Any]] = []
     controls: list[np.ndarray] = []
@@ -395,14 +417,14 @@ def run_trial(
         obs = env.task.get_obs(env, AGENT_ID).astype(np.float32)
         obs = np.expand_dims(obs, axis=0)
         with torch.no_grad():
-            action_tensor, _, rnn_tensor = actor(
+            action_tensor, _, next_state = actor(
                 obs,
-                rnn_states,
+                policy_state,
                 masks,
                 deterministic=True,
             )
         action = action_tensor.detach().cpu().numpy().reshape(1, -1).astype(np.int64)
-        rnn_states = rnn_tensor.detach().cpu().numpy()
+        policy_state = next_state.detach().cpu().numpy()
 
         continuous_action = env.task.normalize_action(env, AGENT_ID, action[0])
         controls.append(np.asarray(continuous_action, dtype=np.float64))

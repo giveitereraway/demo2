@@ -296,8 +296,8 @@ def _get_eval_config(parser: argparse.ArgumentParser):
                        help="number of episodes of a single evaluation. (default 32)")
     group.add_argument("--heading-first-target", action="store_true",
                        help="在 heading 验证中保存首次达到跟踪门槛的模型")
-    group.add_argument("--heading-error-limits", type=float, nargs=3, default=(10, 100, 24),
-                       metavar=("DEG", "M", "MPS"), help="航向、高度、纵向速度误差上限")
+    group.add_argument("--heading-error-limits", type=float, nargs="+", default=(10, 100, 24),
+                       metavar="LIMIT", help="航向、高度误差上限，可追加纵向速度上限；省略速度时不检查速度")
     group.add_argument("--heading-target-pass-rate", type=float, default=0.9,
                        help="达到跟踪门槛所需的验证回合通过率")
     group.add_argument("--heading-target-eval-seed", type=int, default=2026,
