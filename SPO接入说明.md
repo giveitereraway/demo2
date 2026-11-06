@@ -62,13 +62,9 @@ python scripts/train/train_jsbsim.py --env-name SingleCombat --algorithm-name pp
 
 前三项汇总每个更新批次在执行该次梯度更新前的概率比。SPO 提供软惩罚，概率比仍可能越界。原有熵计算和批量设置在各组中保持一致。
 
-这些指标沿用 Runner 现有的 W&B 记录通道。需要保存日志时，在训练命令中追加 `--use-wandb --log-interval 1`；离线使用可先执行：
+这些指标默认由 SwanLab 离线记录，追加 `--log-interval 1` 可在每轮更新后记录。
 
-```powershell
-$env:WANDB_MODE = "offline"
-```
-
-离线模式将指标及包含 `policy_loss` 的运行配置保存在本地 W&B 运行目录。未启用 `--use-wandb` 时，现有 Runner 不会将这些详细指标写入文件。
+离线模式把指标历史及包含 `policy_loss` 的运行配置保存到本次训练的 `swanlog/`。每次运行的最新有限标量指标另存于 `training-summary.json`。
 
 运行针对性验证：
 

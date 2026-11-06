@@ -24,6 +24,7 @@ from agent_system.rag_adapter import (
     validate_knowledge_base_dir,
 )
 from agent_system.result_analysis import analyze_result, infer_result_dir
+from runner.experiment_tracking import SWANLAB_MODES
 from agent_system.routing import build_task_graph
 from agent_system.settings import AgentSettings, REPO_ROOT
 
@@ -119,7 +120,8 @@ def render_train() -> None:
         use_eval = st.checkbox("训练中评估", value=default.use_eval)
         use_prior = st.checkbox("导弹发射先验", value=default.use_prior)
         cuda = st.checkbox("CUDA", value=default.cuda)
-        use_wandb = st.checkbox("W&B", value=default.use_wandb)
+        swanlab_mode = st.selectbox("SwanLab 记录模式", SWANLAB_MODES,
+                                   index=SWANLAB_MODES.index(default.swanlab_mode))
         submitted = st.form_submit_button("生成训练命令")
     if submitted:
         config = TrainConfig(
@@ -136,7 +138,7 @@ def render_train() -> None:
             use_eval=use_eval,
             use_prior=use_prior,
             cuda=cuda,
-            use_wandb=use_wandb,
+            swanlab_mode=swanlab_mode,
         )
         st.session_state.train_spec = build_train_command(config)
     if "train_spec" in st.session_state:

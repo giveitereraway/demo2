@@ -11,7 +11,6 @@ encoder="${2:-temporal_attention}"
 seed=1
 exp="heading_${loss}_${encoder}"
 
-export WANDB_MODE="offline"
 
 case "$encoder" in
     gru)
@@ -42,4 +41,4 @@ CUDA_VISIBLE_DEVICES=0 python train/train_jsbsim.py \
     --eval-interval 10 --eval-episodes 32 --n-eval-rollout-threads 4 \
     --heading-error-limits 10 200 \
     --heading-target-pass-rate 0.9 --heading-target-eval-seed 2026 \
-    --user-name sf --use-wandb --wandb-name aircraft
+    --user-name sf

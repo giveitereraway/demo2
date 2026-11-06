@@ -9,6 +9,39 @@ import numpy as np
 import pytest
 
 from config import get_config
+from runner import experiment_tracking
+
+
+def test_swanlab_mode_and_run_directory(monkeypatch, tmp_path):
+    args = get_config().parse_args([])
+    args.scenario_name = "1/heading"
+    monkeypatch.setattr(experiment_tracking, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(experiment_tracking, "load_dotenv", lambda **kwargs: None)
+    monkeypatch.delenv("SWANLAB_MODE", raising=False)
+    calls = []
+    run = object()
+    fake_swanlab = SimpleNamespace(
+        Settings=lambda **kwargs: kwargs,
+        init=lambda **kwargs: calls.append(kwargs) or run,
+    )
+    monkeypatch.setitem(sys.modules, "swanlab", fake_swanlab)
+
+    first_dir = experiment_tracking.create_run_dir(args)
+    (first_dir.parent / "run-not-a-number").mkdir()
+    second_dir = experiment_tracking.create_run_dir(args)
+    assert (first_dir.name, second_dir.name) == ("run1", "run2")
+    assert experiment_tracking.track_swanlab(args, first_dir) is run
+    assert calls[-1]["mode"] == "offline"
+    assert calls[-1]["config"]["swanlab_mode"] == "offline"
+    assert Path(calls[-1]["logdir"]) == first_dir / "swanlog"
+
+    monkeypatch.setenv("SWANLAB_MODE", "online")
+    assert experiment_tracking.track_swanlab(args, second_dir) is run
+    assert calls[-1]["mode"] == "online"
+    args.swanlab_mode = "disabled"
+    with experiment_tracking.track_swanlab(args, second_dir) as disabled_run:
+        assert disabled_run is None
+    assert len(calls) == 2
 
 
 @pytest.fixture
@@ -20,8 +53,7 @@ def runner_modules(monkeypatch):
     torch.save = lambda state, path: saved.__setitem__(Path(path).name, state.copy())
     buffer = ModuleType("algorithms.utils.buffer")
     buffer.ReplayBuffer = buffer.SharedReplayBuffer = object
-    for name, module in [("torch", torch), ("wandb", ModuleType("wandb")),
-                         ("algorithms.utils.buffer", buffer)]:
+    for name, module in [("torch", torch), ("algorithms.utils.buffer", buffer)]:
         monkeypatch.setitem(sys.modules, name, module)
 
     package_name = "_eval_checkpoint_test_runner"
@@ -97,6 +129,21 @@ def make_runner(modules, tmp_path, kind="jsbsim_runner", score=None, **overrides
                            else (None, None, None, []))
     return Harness({"all_args": args, "envs": envs, "eval_envs": object() if args.use_eval else None,
                     "device": "cpu", "render_mode": "txt", "run_dir": tmp_path})
+
+
+def test_swanlab_metrics_and_local_summary(runner_modules, tmp_path):
+    runner = make_runner(runner_modules, tmp_path)
+    calls = []
+    runner.swanlab_run = SimpleNamespace(log=lambda metrics, step: calls.append((step, metrics)))
+
+    runner.log_info({"value_loss": np.float32(0.25), "explained_variance": np.nan}, 32)
+    runner.log_info({"eval_average_episode_rewards": 9.0}, 32)
+
+    assert calls == [(32, {"value_loss": 0.25}), (32, {"eval_average_episode_rewards": 9.0})]
+    assert json.loads((tmp_path / "training-summary.json").read_text(encoding="utf-8")) == {
+        "step": 32,
+        "metrics": {"value_loss": 0.25, "eval_average_episode_rewards": 9.0},
+    }
 
 
 @pytest.mark.parametrize("reward", [np.nan, np.inf, -np.inf])

@@ -77,10 +77,10 @@ EXPERIMENT_NAME = "follow_2e8_A_vs_follow_1e8_B"
 EVAL_SCENARIO_NAME = "1v1/NoWeapon/Selfplay"
 
 # 两个 actor 可以来自不同训练场景；脚本会按各自场景构造网络动作空间。
-ACTOR_A_PATH = "E:/clone/demo2/scripts/results/SingleCombat/1v1/NoWeapon/Selfplay/ppo/1v1_follow_2e8/wandb/offline-run-20260617_150234-2fbfp5qn/files/actor_latest.pt"
+ACTOR_A_PATH = None
 ACTOR_A_SCENARIO_NAME = "1v1/NoWeapon/Selfplay"
 
-ACTOR_B_PATH = "E:/clone/demo1/scripts/results/SingleCombat/1v1/NoWeapon/Selfplay/ppo/1v1_follow/wandb/offline-run-20260512_175151-yryla8wg/files/actor_latest.pt"
+ACTOR_B_PATH = None
 ACTOR_B_SCENARIO_NAME = "1v1/NoWeapon/Selfplay"
 
 # 分层 actor 的低层控制器。
@@ -209,9 +209,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="1v1 actor 对战评估脚本。")
     parser.add_argument("--experiment-name", default=EXPERIMENT_NAME)
     parser.add_argument("--eval-scenario-name", default=EVAL_SCENARIO_NAME)
-    parser.add_argument("--actor-a-path", default=str(ACTOR_A_PATH))
+    parser.add_argument("--actor-a-path", help="Actor A 的权重文件路径")
     parser.add_argument("--actor-a-scenario-name", default=ACTOR_A_SCENARIO_NAME)
-    parser.add_argument("--actor-b-path", default=str(ACTOR_B_PATH))
+    parser.add_argument("--actor-b-path", help="Actor B 的权重文件路径")
     parser.add_argument("--actor-b-scenario-name", default=ACTOR_B_SCENARIO_NAME)
     parser.add_argument("--lowlevel-actor-path", default=str(LOWLEVEL_ACTOR_PATH))
     parser.add_argument("--num-episodes", type=int, default=NUM_EPISODES)
@@ -1768,7 +1768,10 @@ def plot_existing_results(result_dir: Path) -> None:
 
 
 def main(argv: Optional[List[str]] = None) -> None:
-    args = build_arg_parser().parse_args(argv)
+    parser = build_arg_parser()
+    args = parser.parse_args(argv)
+    if not args.plot_only_result_dir and not (args.actor_a_path and args.actor_b_path):
+        parser.error("对战评估需要指定 --actor-a-path 和 --actor-b-path。")
     apply_cli_args(args)
 
     if PLOT_ONLY_RESULT_DIR is not None:

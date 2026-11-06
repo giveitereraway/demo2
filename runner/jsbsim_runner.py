@@ -226,11 +226,12 @@ class JSBSimRunner(Runner):
         if tracking:
             eval_infos["heading_tracking_pass_rate"] = passed / self.eval_episodes
             self.record_heading_first_target(total_num_steps, passed)
-        eval_infos['eval_average_episode_rewards'] = np.concatenate(eval_episode_rewards).mean(axis=1)  # shape: [num_agents, 1]
-        logging.info(" eval average episode rewards: " + str(np.mean(eval_infos['eval_average_episode_rewards'])))
+        mean_reward = float(np.concatenate(eval_episode_rewards).mean(axis=1).mean())
+        eval_infos['eval_average_episode_rewards'] = mean_reward
+        logging.info(" eval average episode rewards: %s", mean_reward)
         self.log_info(eval_infos, total_num_steps)
         logging.info("...End evaluation")
-        return float(np.mean(eval_infos['eval_average_episode_rewards']))
+        return mean_reward
 
     def record_heading_first_target(self, total_num_steps, passed):
         args = self.all_args

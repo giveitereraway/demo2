@@ -31,11 +31,9 @@ from gymnasium import spaces
 
 
 # =========================
-# 可修改实验参数E:\clone\demo2\scripts\results\SingleControl\1\heading\ppo\demo2_heading\wandb\offline-run-20260601_175507-5x9h1hyu\files
 # =========================
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-MODEL_PATH = REPO_ROOT / "scripts/results/SingleControl/1/heading/ppo/v1/wandb/run-20260120_173422-hvmwmud7/files/actor_latest.pt"
 SCENARIO_NAME = "1/heading"
 OUTPUT_DIR = REPO_ROOT / "experiments" / "results" / "chapter_3"
 
@@ -111,7 +109,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="评估 GRU 或时序注意力模型对航向、高度、速度指令的跟踪效果。"
     )
-    parser.add_argument("--model-path", type=Path, default=MODEL_PATH,
+    parser.add_argument("--model-path", type=Path, required=True,
                         help="actor 权重文件，模型配置 model_config.json 与权重放在同一目录。")
     parser.add_argument("--output-dir", type=Path, default=OUTPUT_DIR)
     parser.add_argument("--scenario-name", type=str, default=SCENARIO_NAME)

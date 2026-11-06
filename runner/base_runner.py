@@ -1,11 +1,15 @@
+import json
+import logging
+import math
 import os
 import sys
-import wandb
+from numbers import Real
+from pathlib import Path
+
 import torch
 import numpy as np
 sys.path.append(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 from algorithms.utils.buffer import ReplayBuffer
-import logging
 
 def _t2n(x):
     return x.detach().cpu().numpy()
@@ -34,7 +38,8 @@ class Runner(object):
         self.n_rollout_threads = self.all_args.n_rollout_threads
         self.n_eval_rollout_threads = self.all_args.n_eval_rollout_threads
         self.buffer_size = self.all_args.buffer_size
-        self.use_wandb = self.all_args.use_wandb
+        self.swanlab_run = config.get("swanlab_run")
+        self.latest_metrics = {}
 
         # interval
         self.save_interval = self.all_args.save_interval
@@ -50,12 +55,8 @@ class Runner(object):
         # dir
         self.model_dir = self.all_args.model_dir
         self.run_dir = config["run_dir"]
-        if self.use_wandb:
-            self.save_dir = str(wandb.run.dir)
-        else:
-            self.save_dir = str(self.run_dir)
-            if not os.path.exists(self.save_dir):
-                os.makedirs(self.save_dir)
+        self.save_dir = str(self.run_dir)
+        os.makedirs(self.save_dir, exist_ok=True)
 
         self.load()
 
@@ -138,14 +139,25 @@ class Runner(object):
         self.policy.critic.load_state_dict(policy_critic_state_dict)
 
     def log_info(self, infos, total_num_steps):
-        if self.use_wandb:
+        metrics = {name: float(value) for name, value in infos.items()
+                   if isinstance(value, Real) and math.isfinite(value)}
+        if not metrics:
+            return
+        step = int(total_num_steps)
+        self.latest_metrics.update(metrics)
+        summary_path = Path(self.save_dir) / "training-summary.json"
+        temp_path = summary_path.with_suffix(".tmp")
+        try:
+            temp_path.write_text(json.dumps({"step": step, "metrics": self.latest_metrics}), encoding="utf-8")
+            temp_path.replace(summary_path)
+        except OSError as exc:
+            logging.warning("保存训练摘要失败：%s", exc)
+
+        if self.swanlab_run is not None:
             try:
-                wandb.log(infos, step=total_num_steps)
-            except Exception as e:
-                logging.warning(f"WandB logging failed, disable WandB logging and continue training: {e}")
-                self.use_wandb = False
-        else:
-            pass
+                self.swanlab_run.log(metrics, step=step)
+            except Exception as exc:
+                logging.warning("SwanLab 指标记录失败，继续训练：%s", type(exc).__name__)
         
     def render_with_tacview(self, data):
         """

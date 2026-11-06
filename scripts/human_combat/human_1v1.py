@@ -3,18 +3,16 @@ import sys
 import os
 import time
 import traceback
-import wandb
-import socket
 import torch
 import random
 import logging
 import numpy as np
-from pathlib import Path
 import setproctitle
 
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__)))))
 from config import get_config
+from runner.experiment_tracking import create_run_dir, track_swanlab
 from runner.share_jsbsim_runner import ShareJSBSimRunner
 from envs.JSBSim.envs import SingleCombatEnv, SingleControlEnv, MultipleCombatEnv
 from envs.env_wrappers import SubprocVecEnv, DummyVecEnv, ShareSubprocVecEnv, ShareDummyVecEnv
@@ -26,7 +24,7 @@ from envs.JSBSim.test.test_baseline_use_env import BaselineAgent, PursueAgent
 from envs.JSBSim.envs.singlecontrol_env import SingleControlEnv
 from envs.JSBSim.human_task.HumanSingleCombatTask import HumanSingleCombatTask
 
-from scripts.train.train_jsbsim import parse_args, make_train_env,make_eval_env
+from scripts.train.train_jsbsim import parse_args
 from runner.tacview import Tacview
 def main(args):
     parser = get_config()
@@ -50,50 +48,15 @@ def main(args):
         device = torch.device("cpu")
         torch.set_num_threads(all_args.n_training_threads)
 
-    # run dir
-    run_dir = Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__))) + "/results") \
-        / all_args.env_name / all_args.scenario_name / all_args.algorithm_name / all_args.experiment_name
-    if not run_dir.exists():
-        os.makedirs(str(run_dir))
-
-    # wandb
-    if all_args.use_wandb:
-        run = wandb.init(config=all_args,
-                         project=all_args.env_name,
-                         notes=socket.gethostname(),
-                         name=f"{all_args.experiment_name}_seed{all_args.seed}",
-                         group=all_args.scenario_name,
-                         dir=str(run_dir),
-                         job_type="training",
-                         reinit=True)
-    else:
-        if not run_dir.exists():
-            curr_run = 'run1'
-        else:
-            exst_run_nums = [int(str(folder.name).split('run')[1]) for folder in run_dir.iterdir() if str(folder.name).startswith('run')]
-            if len(exst_run_nums) == 0:
-                curr_run = 'run1'
-            else:
-                curr_run = 'run%i' % (max(exst_run_nums) + 1)
-        run_dir = run_dir / curr_run
-        if not run_dir.exists():
-            os.makedirs(str(run_dir))
-
     setproctitle.setproctitle(str(all_args.algorithm_name) + "-" + str(all_args.env_name)
                               + "-" + str(all_args.experiment_name) + "@" + str(all_args.user_name))
 
-    # env init
-    envs = make_train_env(all_args)
-    eval_envs = make_eval_env(all_args) if all_args.use_eval else None
+    run_dir = create_run_dir(all_args)
+    with track_swanlab(all_args, run_dir, job_type="human_loop"):
+        run_simulation(all_args, device)
 
-    config = {
-        "all_args": all_args,
-        "envs": envs,
-        "eval_envs": eval_envs,
-        "device": device,
-        "run_dir": run_dir
-    }
 
+def run_simulation(all_args, device):
     # 你可以在这里传入你的配置或初始化环境
 
     tacview = Tacview()

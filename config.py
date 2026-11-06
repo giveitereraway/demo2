@@ -1,6 +1,8 @@
 import argparse
 from tokenize import group
 
+from runner.experiment_tracking import DEFAULT_TRAIN_SWANLAB_MODE, SWANLAB_MODES
+
 
 def get_config():
     """
@@ -46,12 +48,10 @@ def _get_prepare_config(parser: argparse.ArgumentParser):
             number of env steps to train (default: 1e7)
         --model-dir <str>
             by default None. set the path to pretrained model.
-        --use-wandb
-            [for wandb usage], by default False, if set, will log date to wandb server.
+        --swanlab-mode <str>
+            SwanLab 记录模式，训练默认离线，人机交互默认关闭。
         --user-name <str>
-            [for wandb usage], to specify user's name for simply collecting training data.
-        --wandb-name <str>
-            [for wandb usage], to specify user's name for simply collecting training data.
+            用于进程名称的用户标识。
     """
     group = parser.add_argument_group("Prepare parameters")
     group.add_argument("--env-name", type=str, default='JSBSim',
@@ -72,12 +72,10 @@ def _get_prepare_config(parser: argparse.ArgumentParser):
                        help='Number of environment steps to train (default: 1e7)')
     group.add_argument("--model-dir", type=str, default=None,
                        help="By default None. set the path to pretrained model.")
-    group.add_argument("--use-wandb", action='store_true', default=False,
-                       help="[for wandb usage], by default False, if set, will log date to wandb server.")
+    group.add_argument("--swanlab-mode", choices=SWANLAB_MODES,
+                       help=f"SwanLab 记录模式，训练默认 {DEFAULT_TRAIN_SWANLAB_MODE}，可通过 SWANLAB_MODE 覆盖。")
     group.add_argument("--user-name", type=str, default='liuqh',
                        help="for setprobtitle use")
-    group.add_argument("--wandb-name", type=str, default='liuqh',
-                       help="[for wandb usage], to specify user's name for simply collecting training data.")
     return parser
 
 

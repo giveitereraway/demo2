@@ -5,8 +5,8 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+from project_env import REPO_ROOT, load_dotenv
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_SILICONFLOW_BASE_URL = "https://api.siliconflow.cn/v1"
 DEFAULT_AGENT_MODEL = "Qwen/Qwen3.5-122B-A10B"
 DEFAULT_RAG_PROJECT_ROOT = Path(r"E:\AI_practice\Agentic_RAG")
@@ -21,27 +21,8 @@ DEFAULT_TACTICAL_ACTOR_PATH = (
     / "TacticalHierarchySelfplay"
     / "ppo"
     / "1v1_tactical_hierarchy_2"
-    / "wandb"
-    / "offline-run-20260516_131027-v6k42xjz"
-    / "files"
+    / "run1"
 )
-
-
-def load_dotenv(path: Path | None = None) -> None:
-    """轻量加载 .env，避免为启动器额外引入依赖。"""
-    env_path = path or (REPO_ROOT / ".env")
-    if not env_path.exists():
-        return
-
-    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        key = key.strip()
-        value = value.strip().strip('"').strip("'")
-        if key and key not in os.environ:
-            os.environ[key] = value
 
 
 @dataclass(frozen=True)

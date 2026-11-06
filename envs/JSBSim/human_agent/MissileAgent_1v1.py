@@ -6,7 +6,6 @@ from ..envs.singlecontrol_env import SingleControlEnv
 from .agent_base import BaseAgent
 import curses
 import threading
-import gym
 
 class MissileAgent_1v1(BaseAgent):
     def __init__(self, env: SingleControlEnv, agent_id: int):

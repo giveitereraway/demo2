@@ -6,14 +6,13 @@ We provide a competitive environment for red and blue aircrafts games, which inc
 ## Install 
 
 ```shell
-# create python env
-conda create -n jsbsim python=3.8
-# install dependency
-pip install torch pymap3d jsbsim==1.1.6 geographiclib gym==0.20.0 wandb icecream setproctitle. 
+# 创建训练环境
+conda create -n jsbsim python=3.10
+conda activate jsbsim
+python -m pip install -r requirements.txt
 
-- Download Shapely‑1.7.1‑cp38‑cp38‑win_amd64.whl from [here](https://www.lfd.uci.edu/~gohlke/pythonlibs/#shapely), and `pip install shaply` from local file.
-
-- Initialize submodules(*JSBSim-Team/jsbsim*): `git submodule init; git submodule update`
+# 初始化 JSBSim 数据子模块
+git submodule update --init --recursive
 ```
 ## Envs
 We provide all task configs in  `envs/JSBSim/configs`, each config corresponds to a task.
@@ -66,7 +65,11 @@ It can be adapted to other tasks by modifying a few parameter settings.
 
 The description of parameter setting refers to `config.py`.
 Note that we set parameters `--use-selfplay --selfplay-algorithm --n-choose-opponents --use-eval --n-eval-rollout-threads --eval-interval --eval-episodes` in selfplay-setting training. `--use-prior` is only set true for shoot missile tasks.
-We use wandb to track the training process. If you set `--use-wandb`, please replace the `--wandb-name` with your name. 
+训练默认使用 SwanLab 离线记录。实验按环境建项目、按场景分组，指标使用累计环境步数作为横轴。需要实时上传时，可传 `--swanlab-mode online`，通过 `SWANLAB_MODE=online` 启动 Shell 脚本，或在 Agent 里选择 `online`。在线模式从仓库根目录的 `.env` 或进程环境读取 `SWANLAB_API_KEY`。传入 `--swanlab-mode disabled` 可关闭 SwanLab。
+
+离线日志可通过 `swanlab sync` 同步。在线初始化遇到网络超时等临时错误时，SwanLab 默认降级为离线记录。
+
+每次训练独立分配 `scripts/results/{env}/{scenario}/{algorithm}/{experiment}/runN/`。模型权重、训练摘要及本地评估产物保存在该目录，SwanLab 日志放在其 `swanlog/` 子目录。续训和渲染时把包含权重的目录传给 `--model-dir`。
 
 开启 `--use-eval` 后，每次验证使用 `--eval-episodes` 个回合，验证频率由 `--eval-interval` 控制。验证平均回合奖励严格创新高时更新 `actor_best.pt` 和 `critic_best.pt`。训练结束时保存 `actor_latest.pt` 和 `critic_latest.pt`。
 
@@ -74,8 +77,7 @@ We use wandb to track the training process. If you set `--use-wandb`, please rep
 
 ### Evaluate and Render
 ```bash
-cd renders
-python render*.py
+python renders/render_1v1.py --ego-actor "$EGO_ACTOR" --enemy-actor "$ENEMY_ACTOR"
 ```
 This will generate a `*.acmi` file. We can use [**TacView**](https://www.tacview.net/), a universal flight analysis tool, to open the file and watch the render videos.
 

@@ -1,0 +1,34 @@
+# 建议使用 Python 3.10 或 3.11；安装命令：python -m pip install -r requirements.txt
+# GPU 训练请先安装适合本机 CUDA 环境的 PyTorch，再安装本文件中的其余依赖。
+
+# PPO / MAPPO 与 JSBSim 仿真
+# flatten.py 仍使用 np.int，因此暂时限制 NumPy < 1.24。
+numpy>=1.23.5,<1.24
+torch>=2.0,<3.0
+gymnasium>=0.29,<1.0
+jsbsim>=1.1.6,<2.0
+pymap3d>=3.0,<4.0
+PyYAML>=6.0,<7.0
+cloudpickle>=2.2,<4.0
+
+# 训练日志与进程管理
+swanlab>=0.10.4,<1.0
+setproctitle>=1.3,<2.0
+
+# 实验结果、奖励函数与飞行轨迹绘图
+matplotlib>=3.7,<4.0
+
+# Windows 人机交互终端
+windows-curses>=2.3,<3.0; sys_platform == "win32"
+
+# 航电智能 Agent 界面、任务路由和 RAG 适配
+streamlit>=1.32,<2.0
+langgraph>=0.2,<2.0
+langchain-core>=0.3,<2.0
+typing-extensions>=4.7,<5.0
+# RAG 问答还需要外部 Agentic_RAG 项目及其依赖；请在对应运行环境中
+# 按外部项目的依赖清单安装，并通过 .env 配置 RAG_PROJECT_ROOT 和 AGENT_PYTHON_ENV。
+# 本清单不安装外部项目源码、知识库，也不安装独立的 Tacview 软件。
+
+# 项目测试
+pytest>=7.4,<9.0

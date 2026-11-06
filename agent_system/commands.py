@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Mapping
 
+from runner.experiment_tracking import DEFAULT_TRAIN_SWANLAB_MODE
+
 from .settings import AgentSettings, DEFAULT_TACTICAL_ACTOR_PATH, REPO_ROOT
 from .tactical_actions import parse_action_reference
 from .tactical_policy import resolve_actor_checkpoint_path
@@ -85,8 +87,7 @@ class TrainConfig:
     experiment_name: str = "agent_hierarchy_no_weapon"
     seed: int = 1
     cuda: bool = True
-    use_wandb: bool = True
-    wandb_offline: bool = True
+    swanlab_mode: str = DEFAULT_TRAIN_SWANLAB_MODE
     use_selfplay: bool = True
     selfplay_algorithm: str = "fsp"
     n_choose_opponents: int = 1
@@ -187,13 +188,11 @@ def build_train_command(config: TrainConfig) -> CommandSpec:
         "8",
         "--user-name",
         "sf",
-        "--wandb-name",
-        "aircraft",
+        "--swanlab-mode",
+        config.swanlab_mode,
     ]
     if config.cuda:
         command.append("--cuda")
-    if config.use_wandb:
-        command.append("--use-wandb")
     if config.use_eval:
         command.extend(
             [
@@ -221,9 +220,9 @@ def build_train_command(config: TrainConfig) -> CommandSpec:
     if config.model_dir:
         command.extend(["--model-dir", str(_path(config.model_dir))])
 
-    env = {"WANDB_MODE": "offline"} if config.wandb_offline else {}
     expected_dir = REPO_ROOT / "scripts" / "results" / config.env_name / config.scenario_name / config.algorithm_name / config.experiment_name
-    return CommandSpec("训练 Agent", command, REPO_ROOT, env, expected_dir)
+    return CommandSpec("训练 Agent", command, REPO_ROOT, env={"PYTHONIOENCODING": "utf-8"},
+                       expected_output_dir=expected_dir)
 
 
 @dataclass

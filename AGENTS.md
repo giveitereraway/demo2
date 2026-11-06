@@ -103,6 +103,6 @@ bash train_tactical_selfplay_shoot.sh
 - 训练结果默认在 `scripts/results/{env}/{scenario}/{algorithm}/{experiment}/runX/`。
 - 对比评估和图表结果通常在 `experiments/results/`。
 - Tacview 轨迹为 `.acmi` / `.txt.acmi`，可用于论文实验分析。
-- W&B 可离线使用，常见设置是 `WANDB_MODE=offline`。
+- 训练默认使用 SwanLab 离线记录，可用 `SWANLAB_MODE=online` 切换为在线记录。
 - JSBSim 相关测试依赖 `torch`、`gymnasium`、`jsbsim`、`pymap3d` 等本机环境，失败时先区分依赖问题和代码问题。
 - Windows 终端可能显示中文乱码；编辑文档和代码时保持 UTF-8。

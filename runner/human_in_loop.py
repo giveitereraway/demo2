@@ -2,7 +2,6 @@ import sys
 import os
 import time
 import traceback
-import wandb
 import socket
 import torch
 import random

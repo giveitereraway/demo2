@@ -24,24 +24,24 @@ python scripts/agent/agent_tactical_1v1_demo.py `
 ```powershell
 python scripts/agent/agent_tactical_1v1_demo.py `
   --render-mode real_time `
-  --enemy-path E:\clone\demo1\scripts\results\SingleCombat\1v1\NoWeapon\TacticalHierarchySelfplay\ppo\1v1_tactical_hierarchy_2\wandb\offline-run-20260516_131027-v6k42xjz\files `
+  --enemy-path $env:ENEMY_ACTOR_PATH `
   --status-interval 0
 ```
 
-`--actor-path` 有默认值：
+`--actor-path` 默认使用项目下的训练目录。
 
 ```text
-E:\clone\demo1\scripts\results\SingleCombat\1v1\NoWeapon\TacticalHierarchySelfplay\ppo\1v1_tactical_hierarchy_2\wandb\offline-run-20260516_131027-v6k42xjz\files
+scripts/results/SingleCombat/1v1/NoWeapon/TacticalHierarchySelfplay/ppo/1v1_tactical_hierarchy_2/run1
 ```
 
-它可以指向 `actor_latest.pt` 文件，也可以指向包含 `actor_latest.pt` 的 `files` 目录。该 actor 必须是 `1v1/NoWeapon/TacticalHierarchySelfplay` 训练出的高层 tactical actor，动作空间应为 `Discrete(12)`，输出的是战术动作编号，不是 4 维底层飞控动作。
+它可以指向 `actor_latest.pt` 文件，也可以指向包含该文件的目录。该 actor 必须是 `1v1/NoWeapon/TacticalHierarchySelfplay` 训练出的高层 tactical actor，动作空间为 `Discrete(12)`，输出战术动作编号。
 
 敌机现在也支持 actor 模型。`--enemy-path` 不传时会复用当前 `--actor-path`，因此默认情况下双方都由 tactical actor 推理；如果显式传入 `--enemy-action`，敌机改为固定战术动作，并且该固定动作优先于 `--enemy-path`。
 
 常用参数：
 
 - `--scenario-name`：默认 `1v1/NoWeapon/TacticalHierarchySelfplay`。
-- `--actor-path`：默认使用上面的 `files` 目录；如果传目录，脚本会自动读取目录下的 `actor_latest.pt`。
+- `--actor-path`：默认使用上面的训练目录。传入目录时，脚本会自动读取目录下的 `actor_latest.pt`。
 - `--enemy-path`：敌机 tactical actor 路径；不传时复用 `--actor-path`，同样可以是 `actor_latest.pt` 或包含该文件的目录。
 - `--agent-id`：默认 `A0100`，表示接受人工指令和 actor fallback 的己方飞机。
 - `--enemy-action`：敌机固定战术动作；显式传入时优先于 `--enemy-path`，例如 `PURE_PURSUIT`、`LEAD_PURSUIT` 或动作编号。

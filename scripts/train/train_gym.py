@@ -2,16 +2,15 @@
 import sys
 import os
 import gymnasium as gym
-import wandb
-import socket
 import torch
 import random
 import numpy as np
-from pathlib import Path
+from contextlib import ExitStack
 import logging
 import setproctitle
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__)))))
 from config import get_config
+from runner.experiment_tracking import create_run_dir, track_swanlab
 from envs.env_wrappers import SubprocVecEnv, DummyVecEnv
 
 
@@ -21,16 +20,21 @@ class GymEnv:
         self.action_shape = self.env.action_space.shape
         self.action_space = self.env.action_space
         self.observation_space = self.env.observation_space
+        self.reset_seed = None
 
     def reset(self):
-        observation = self.env.reset()
+        observation, _ = self.env.reset(seed=self.reset_seed)
+        self.reset_seed = None
         return np.array(observation).reshape((1, -1))
 
     def step(self, action):
         action = np.array(action).reshape(self.action_shape)
-        observation, reward, done, info = self.env.step(action)
+        return self._step(action.item() if action.ndim == 0 else action)
+
+    def _step(self, action):
+        observation, reward, terminated, truncated, info = self.env.step(action)
         observation = np.array(observation).reshape((1, -1))
-        done = np.array(done).reshape((1,-1))
+        done = np.array(terminated or truncated).reshape((1, -1))
         reward = np.array(reward).reshape((1, -1))
         return observation, reward, done, info
 
@@ -41,37 +45,20 @@ class GymEnv:
         self.env.close()
     
     def seed(self, seed=None):
-        return self.env.seed(seed)
+        self.reset_seed = seed
     
 
 class GymHybridEnv(GymEnv):
     def __init__(self, env) -> None:
-        self.env = env
-        self.action_space = self.env.action_space
+        super().__init__(env)
         self.discrete_dims = self.action_space[0].shape[0]
         self.continuous_dims = self.action_space[1].shape[0]
         self.action_shape = (self.discrete_dims+self.continuous_dims,)
-        self.observation_space = self.env.observation_space
-    
-    def reset(self):
-        observation = self.env.reset()
-        return np.array(observation).reshape((1, -1))
 
     def step(self, action):
         action = np.array(action).reshape(self.action_shape)
         discrete_a, continuous_a = action[:self.discrete_dims].astype(np.int32), action[self.discrete_dims:]
-        action = (discrete_a, continuous_a)
-        observation, reward, done, info = self.env.step(action)
-        observation = np.array(observation).reshape((1, -1))
-        done = np.array(done).reshape((1,-1))
-        reward = np.array(reward).reshape((1, -1))
-        return observation, reward, done, info
-
-    def render(self, mode="human"):
-        self.env.render(mode)
-
-    def close(self):
-        pass
+        return self._step((discrete_a, continuous_a))
 
 
 def make_train_env(all_args):
@@ -140,65 +127,36 @@ def main(args):
         device = torch.device("cpu")
         torch.set_num_threads(all_args.n_training_threads)
 
-    # run dir
-    run_dir = Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__))) + "/results") \
-        / all_args.env_name / all_args.scenario_name / all_args.algorithm_name / all_args.experiment_name
-    if not run_dir.exists():
-        os.makedirs(str(run_dir))
-
-    # wandb
-    if all_args.use_wandb:
-        run = wandb.init(config=all_args,
-                         project=all_args.env_name,
-                         # entity=all_args.wandb_name,
-                         notes=socket.gethostname(),
-                         name=f"{all_args.experiment_name}_seed{all_args.seed}",
-                         group=all_args.scenario_name,
-                         dir=str(run_dir),
-                         job_type="training",
-                         reinit=True)
-    else:
-        if not run_dir.exists():
-            curr_run = 'run1'
-        else:
-            exst_run_nums = [int(str(folder.name).split('run')[1]) for folder in run_dir.iterdir() if str(folder.name).startswith('run')]
-            if len(exst_run_nums) == 0:
-                curr_run = 'run1'
-            else:
-                curr_run = 'run%i' % (max(exst_run_nums) + 1)
-        run_dir = run_dir / curr_run
-        if not run_dir.exists():
-            os.makedirs(str(run_dir))
+    run_dir = create_run_dir(all_args)
 
     setproctitle.setproctitle(str(all_args.algorithm_name) + "-" + str(all_args.env_name)
                               + "-" + str(all_args.experiment_name) + "@" + str(all_args.user_name))
 
-    # env init
-    envs = make_train_env(all_args)
-    eval_envs = make_eval_env(all_args) if all_args.use_eval else None
+    with ExitStack() as stack:
+        envs = make_train_env(all_args)
+        stack.callback(envs.close)
+        eval_envs = make_eval_env(all_args) if all_args.use_eval else None
+        if eval_envs is not None:
+            stack.callback(eval_envs.close)
 
-    config = {
-        "all_args": all_args,
-        "envs": envs,
-        "eval_envs": eval_envs,
-        "device": device,
-        "run_dir": run_dir
-    }
+        swanlab_run = stack.enter_context(track_swanlab(all_args, run_dir))
 
-    # run experiments
+        config = {
+            "all_args": all_args,
+            "envs": envs,
+            "eval_envs": eval_envs,
+            "device": device,
+            "run_dir": run_dir,
+            "render_mode": "txt",
+            "swanlab_run": swanlab_run,
+        }
 
-    if all_args.use_selfplay:
-        from runner.selfplay_jsbsim_runner import SelfplayJSBSimRunner as Runner
-    else:
-        from runner.jsbsim_runner import JSBSimRunner as Runner
-    runner = Runner(config)
-    runner.run()
-
-    # post process
-    envs.close()
-
-    if all_args.use_wandb:
-        run.finish()
+        if all_args.use_selfplay:
+            from runner.selfplay_jsbsim_runner import SelfplayJSBSimRunner as Runner
+        else:
+            from runner.jsbsim_runner import JSBSimRunner as Runner
+        runner = Runner(config)
+        runner.run()
 
 
 if __name__ == "__main__":

@@ -41,19 +41,15 @@ def load_result_brief(result_dir: Path) -> str:
             parts.append(json.dumps(rows[:3], ensure_ascii=False, indent=2))
 
     if result_dir.exists():
+        training_summary = result_dir / "training-summary.json"
+        if training_summary.is_file():
+            parts.append("training-summary.json:")
+            parts.append(training_summary.read_text(encoding="utf-8"))
+
         children = sorted(result_dir.iterdir(), key=lambda path: path.stat().st_mtime, reverse=True)[:10]
         if children:
             parts.append("最近产物:")
             parts.extend(str(path) for path in children)
-
-        wandb_summaries = sorted(
-            result_dir.rglob("wandb-summary.json"),
-            key=lambda path: path.stat().st_mtime,
-            reverse=True,
-        )[:3]
-        for wandb_summary in wandb_summaries:
-            parts.append(f"{wandb_summary}:")
-            parts.append(wandb_summary.read_text(encoding="utf-8", errors="replace")[:4000])
 
     if len(parts) == 1:
         parts.append("未找到 summary.json 或 episodes.csv。")

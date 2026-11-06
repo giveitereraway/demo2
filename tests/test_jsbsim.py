@@ -1,11 +1,8 @@
 import sys
 import os
 import pytest
-import torch
-import random
 import gymnasium as gym
 import numpy as np
-from pathlib import Path
 from itertools import product
 from types import SimpleNamespace
 sys.path.append(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
@@ -415,58 +412,18 @@ class TestJSBSimRunner:
         "--env-name SingleCombat --algorithm-name ppo --scenario-name 1v1/DodgeMissile/vsBaseline",
         "--env-name SingleCombat --algorithm-name ppo --scenario-name 1v1/DodgeMissile/HierarchySelfplay",  # whether to use selfplay is optional
         "--env-name SingleCombat --algorithm-name ppo --scenario-name 1v1/DodgeMissile/HierarchyVsBaseline"])
-    def test_training(self, args):
-        from scripts.train.train_jsbsim import make_train_env, make_eval_env, parse_args, get_config, Runner
+    def test_training(self, args, tmp_path, monkeypatch):
+        from runner import experiment_tracking
+        from scripts.train.train_jsbsim import main
         args += ' --experiment-name pytest --seed 1 --n-training-threads 1 --n-rollout-threads 5 --cuda' \
                 ' --log-interval 1 --save-interval 1 --use-eval --eval-interval 1 --eval-episodes 10' \
                 ' --num-mini-batch 5 --buffer-size 1000 --num-env-steps 1e4' \
-                ' --lr 3e-4 --gamma 0.99 --ppo-epoch 4 --clip-params 0.2 --max-grad-norm 2 --entropy-coef 1e-3' \
+                ' --lr 3e-4 --gamma 0.99 --ppo-epoch 4 --clip-param 0.2 --max-grad-norm 2 --entropy-coef 1e-3' \
                 ' --hidden-size 32 --act-hidden-size 32 --recurrent-hidden-size 32 --recurrent-hidden-layers 1 --data-chunk-length 8'
-        args = args.split(' ')
-        parser = get_config()
-        all_args = parse_args(args, parser)
+        monkeypatch.setattr(experiment_tracking, "REPO_ROOT", tmp_path)
+        main([*args.split(), "--swanlab-mode", "disabled"])
+        assert list(tmp_path.rglob("actor_latest.pt"))
 
-        # seed
-        np.random.seed(all_args.seed)
-        random.seed(all_args.seed)
-        torch.manual_seed(all_args.seed)
-        torch.cuda.manual_seed_all(all_args.seed)
-
-        # cuda
-        if all_args.cuda and torch.cuda.is_available():
-            device = torch.device("cuda:0")  # use cude mask to control using which GPU
-            torch.set_num_threads(all_args.n_training_threads)
-            torch.backends.cudnn.deterministic = True
-            torch.backends.cudnn.benchmark = True
-        else:
-            device = torch.device("cpu")
-            torch.set_num_threads(all_args.n_training_threads)
-
-        # run dir
-        run_dir = Path(os.path.dirname(os.path.abspath(__file__)) + "/results") \
-            / all_args.env_name / all_args.scenario_name / all_args.algorithm_name / all_args.experiment_name
-        assert not all_args.use_wandb
-        if not run_dir.exists():
-            os.makedirs(str(run_dir))
-        # env init
-        assert all_args.use_eval
-        envs = make_train_env(all_args)
-        eval_envs = make_eval_env(all_args)
-
-        config = {
-            "all_args": all_args,
-            "envs": envs,
-            "eval_envs": eval_envs,
-            "device": device,
-            "run_dir": run_dir
-        }
-
-        # run experiments
-        runner = Runner(config)
-        runner.run()
-
-        # post process
-        envs.close()
 
 
 class TestMultipleCombatEnv:

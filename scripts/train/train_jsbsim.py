@@ -1,17 +1,15 @@
 #!/usr/bin/env python
 import sys
 import os
-import traceback
-import wandb
-import socket
 import torch
 import random
 import logging
 import numpy as np
-from pathlib import Path
+from contextlib import ExitStack
 import setproctitle
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__)))))
 from config import get_config
+from runner.experiment_tracking import create_run_dir, track_swanlab
 from runner.share_jsbsim_runner import ShareJSBSimRunner
 from envs.JSBSim.envs import SingleCombatEnv, SingleControlEnv, MultipleCombatEnv
 from envs.JSBSim.envs.singlecontrol_env import HeadingTrackingEvalEnv
@@ -129,72 +127,38 @@ def main(args):
         device = torch.device("cpu")
         torch.set_num_threads(all_args.n_training_threads)
 
-    # run dir
-    run_dir = Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__))) + "/results") \
-        / all_args.env_name / all_args.scenario_name / all_args.algorithm_name / all_args.experiment_name
-    if not run_dir.exists():
-        os.makedirs(str(run_dir))
-
-    # wandb
-    if all_args.use_wandb:
-        run = wandb.init(config=all_args,
-                         project=all_args.env_name,
-                         notes=socket.gethostname(),
-                         name=f"{all_args.experiment_name}_seed{all_args.seed}",
-                         group=all_args.scenario_name,
-                         dir=str(run_dir),
-                         job_type="training",
-                         reinit=True)
-    else:
-        if not run_dir.exists():
-            curr_run = 'run1'
-        else:
-            exst_run_nums = [int(str(folder.name).split('run')[1]) for folder in run_dir.iterdir() if str(folder.name).startswith('run')]
-            if len(exst_run_nums) == 0:
-                curr_run = 'run1'
-            else:
-                curr_run = 'run%i' % (max(exst_run_nums) + 1)
-        run_dir = run_dir / curr_run
-        if not run_dir.exists():
-            os.makedirs(str(run_dir))
+    run_dir = create_run_dir(all_args)
 
     setproctitle.setproctitle(str(all_args.algorithm_name) + "-" + str(all_args.env_name)
                               + "-" + str(all_args.experiment_name) + "@" + str(all_args.user_name))
 
-    # env init
-    envs = make_train_env(all_args)
-    eval_envs = make_eval_env(all_args) if all_args.use_eval else None
+    with ExitStack() as stack:
+        envs = make_train_env(all_args)
+        stack.callback(envs.close)
+        eval_envs = make_eval_env(all_args) if all_args.use_eval else None
+        if eval_envs is not None:
+            stack.callback(eval_envs.close)
 
-    render_mode = all_args.render_mode
+        swanlab_run = stack.enter_context(track_swanlab(all_args, run_dir))
 
-    config = {
-        "all_args": all_args,
-        "envs": envs,
-        "eval_envs": eval_envs,
-        "device": device,
-        "run_dir": run_dir,
-        "render_mode": render_mode
-    }
+        config = {
+            "all_args": all_args,
+            "envs": envs,
+            "eval_envs": eval_envs,
+            "device": device,
+            "run_dir": run_dir,
+            "render_mode": all_args.render_mode,
+            "swanlab_run": swanlab_run,
+        }
 
-    # run experiments
-    if all_args.env_name == "MultipleCombat":
-        runner = ShareJSBSimRunner(config)
-    else:
-        if all_args.use_selfplay:
+        if all_args.env_name == "MultipleCombat":
+            Runner = ShareJSBSimRunner
+        elif all_args.use_selfplay:
             from runner.selfplay_jsbsim_runner import SelfplayJSBSimRunner as Runner
         else:
             from runner.jsbsim_runner import JSBSimRunner as Runner
         runner = Runner(config)
-    try:
         runner.run()
-    except BaseException:
-        traceback.print_exc()
-    finally:
-        # post process
-        envs.close()
-
-        if all_args.use_wandb:
-            run.finish()
 
 
 if __name__ == "__main__":

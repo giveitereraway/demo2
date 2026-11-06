@@ -18,7 +18,7 @@ from agent_system.commands import (
     build_visualize_command,
 )
 from agent_system.executor import run_command
-from agent_system.result_analysis import infer_result_dir
+from agent_system.result_analysis import infer_result_dir, load_result_brief
 from agent_system.routing import keyword_route, parse_route_json
 from agent_system.settings import AgentSettings
 from agent_system.settings import DEFAULT_TACTICAL_ACTOR_PATH
@@ -59,7 +59,7 @@ def test_build_train_command_uses_argument_list() -> None:
             scenario_name="1v1/NoWeapon/HierarchySelfplay",
             experiment_name="unit_train",
             cuda=False,
-            use_wandb=False,
+            swanlab_mode="disabled",
         )
     )
     assert spec.command[0] == AgentSettings.load().runtime_python
@@ -67,6 +67,9 @@ def test_build_train_command_uses_argument_list() -> None:
     assert "1v1/NoWeapon/HierarchySelfplay" in spec.command
     assert "--clip-param" in spec.command
     assert "--clip-params" not in spec.command
+    assert spec.command[spec.command.index("--swanlab-mode") + 1] == "disabled"
+    default_command = build_train_command(TrainConfig()).command
+    assert default_command[default_command.index("--swanlab-mode") + 1] == "offline"
 
 
 def test_build_eval_command_exposes_cli_contract() -> None:
@@ -84,6 +87,16 @@ def test_build_eval_command_exposes_cli_contract() -> None:
     assert "--save-acmi" in spec.command
     assert "false" in spec.command
     assert spec.validation_errors == []
+
+
+def test_train_analysis_uses_reported_run_directory(tmp_path) -> None:
+    run_dir = tmp_path / "run2"
+    run_dir.mkdir()
+    (run_dir / "training-summary.json").write_text(
+        json.dumps({"step": 32, "metrics": {"value_loss": 0.25}}), encoding="utf-8",
+    )
+    assert infer_result_dir(f"输出目录: {run_dir}", tmp_path) == run_dir
+    assert '"value_loss": 0.25' in load_result_brief(run_dir)
 
 
 def test_path_normalization_accepts_slashes_quotes_and_reports_missing() -> None:
@@ -247,9 +260,15 @@ def test_tactical_safety_overrides_risky_actions() -> None:
     assert invalid.overridden
 
 
-def test_build_tactical_demo_command_uses_default_actor_and_enemy_paths() -> None:
+def test_build_tactical_demo_command_accepts_run_directory(tmp_path) -> None:
+    actor_dir = tmp_path / "run1"
+    actor_dir.mkdir()
+    checkpoint = actor_dir / "actor_latest.pt"
+    checkpoint.touch()
+    assert TacticalDemoConfig().actor_path == str(DEFAULT_TACTICAL_ACTOR_PATH)
     spec = build_tactical_demo_command(
         TacticalDemoConfig(
+            actor_path=str(actor_dir),
             max_steps=5,
             render_mode="none",
             disable_llm=True,
@@ -265,29 +284,22 @@ def test_build_tactical_demo_command_uses_default_actor_and_enemy_paths() -> Non
     assert "--step-sleep" in spec.command
     assert "--disable-llm" in spec.command
     assert spec.validation_errors == []
-    default_checkpoint = str(DEFAULT_TACTICAL_ACTOR_PATH / "actor_latest.pt")
-    assert spec.command.count(default_checkpoint) == 2
+    assert spec.command.count(str(checkpoint)) == 2
 
-    directory_spec = build_tactical_demo_command(
-        TacticalDemoConfig(actor_path=str(DEFAULT_TACTICAL_ACTOR_PATH), render_mode="none")
-    )
-    assert directory_spec.command.count(default_checkpoint) == 2
-    assert directory_spec.validation_errors == []
-
-    fixed_enemy = build_tactical_demo_command(
-        TacticalDemoConfig(enemy_action="PURE_PURSUIT", render_mode="none")
-    )
+    fixed_enemy = build_tactical_demo_command(TacticalDemoConfig(
+        actor_path=str(actor_dir), enemy_action="PURE_PURSUIT", render_mode="none",
+    ))
     assert "--enemy-action" in fixed_enemy.command
     assert "PURE_PURSUIT" in fixed_enemy.command
     assert fixed_enemy.validation_errors == []
 
     missing_enemy = build_tactical_demo_command(
-        TacticalDemoConfig(enemy_path="missing_enemy.pt", render_mode="none")
+        TacticalDemoConfig(actor_path=str(actor_dir), enemy_path="missing_enemy.pt", render_mode="none")
     )
     assert any("Enemy tactical actor" in item for item in missing_enemy.validation_errors)
 
     invalid_enemy_action = build_tactical_demo_command(
-        TacticalDemoConfig(enemy_action="NOT_A_TACTIC", render_mode="none")
+        TacticalDemoConfig(actor_path=str(actor_dir), enemy_action="NOT_A_TACTIC", render_mode="none")
     )
     assert any("enemy-action" in item for item in invalid_enemy_action.validation_errors)
 
@@ -295,8 +307,10 @@ def test_build_tactical_demo_command_uses_default_actor_and_enemy_paths() -> Non
     assert any("Tactical actor 文件不存在" in item for item in missing.validation_errors)
 
 
-def test_resolve_actor_checkpoint_accepts_files_directory() -> None:
-    assert resolve_actor_checkpoint_path(DEFAULT_TACTICAL_ACTOR_PATH) == DEFAULT_TACTICAL_ACTOR_PATH / "actor_latest.pt"
+def test_resolve_actor_checkpoint_accepts_files_directory(tmp_path) -> None:
+    actor_dir = tmp_path / "files"
+    actor_dir.mkdir()
+    assert resolve_actor_checkpoint_path(actor_dir) == actor_dir / "actor_latest.pt"
 
 
 def test_agent_llm_experiment_manual_schedule_parser() -> None:

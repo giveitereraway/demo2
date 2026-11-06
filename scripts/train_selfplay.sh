@@ -8,7 +8,6 @@ env="SingleCombat"
 scenario="1v1/NoWeapon/Selfplay"
 algo="ppo"
 seed=1
-export WANDB_MODE="offline"
 
 case "${1:-ppo-attention}" in
     ppo-gru)
@@ -43,7 +42,7 @@ case "${1:-ppo-attention}" in
         ;;
 esac
 
-echo "env=${env}, scenario=${scenario}, algo=${algo}, policy_loss=${policy_loss}, exp=${exp}, seed=${seed}, wandb=${WANDB_MODE}"
+echo "env=${env}, scenario=${scenario}, algo=${algo}, policy_loss=${policy_loss}, exp=${exp}, seed=${seed}"
 
 CUDA_VISIBLE_DEVICES=0 python train/train_jsbsim.py \
     --env-name "$env" --algorithm-name "$algo" --scenario-name "$scenario" --experiment-name "$exp" \
@@ -56,4 +55,4 @@ CUDA_VISIBLE_DEVICES=0 python train/train_jsbsim.py \
     --lr 3e-4 --gamma 0.99 --ppo-epoch 4 --clip-param 0.2 --max-grad-norm 2 --entropy-coef 1e-3 \
     "$@" \
     --act-hidden-size "128 128" \
-    --user-name "sf" --use-wandb --wandb-name "aircraft"
+    --user-name "sf"

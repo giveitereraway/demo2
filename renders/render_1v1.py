@@ -1,3 +1,6 @@
+import argparse
+from pathlib import Path
+
 import sys
 import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -29,13 +32,14 @@ def _t2n(x): # 将PyTorch张量（Tensor）转换为NumPy数组（ndarray）
 
 num_agents = 2
 render = True
-ego_policy_index = 1040
-enm_policy_index = 0
 episode_rewards = 0
-ego_run_dir = "E:/clone/demo2/scripts/results/SingleCombat/1v1/NoWeapon/TacticalHierarchySelfplay/ppo/1v1_follow_tactical_demo2/wandb/offline-run-20260602_155345-wfdbhlmv/files"
-enm_run_dir = "E:/clone/demo1/scripts/results/SingleCombat/1v1/NoWeapon/TacticalHierarchySelfplay/ppo/1v1_tactical_hierarchy_2/wandb/offline-run-20260516_131027-v6k42xjz/files"
-#experiment_name = ego_run_dir.split('/')[-4] # ego_run_dir路径中的倒数第4个目录
-experiment_name = "selfplay"
+parser = argparse.ArgumentParser(description="Render an air combat episode with local checkpoints.")
+parser.add_argument("--ego-actor", type=Path, required=True)
+parser.add_argument("--enemy-actor", type=Path, required=True)
+parser.add_argument("--experiment-name", default="selfplay")
+model_args = parser.parse_args()
+experiment_name = model_args.experiment_name
+
 
 env = SingleCombatEnv("1v1/NoWeapon/TacticalHierarchySelfplay")
 env.seed(0)
@@ -45,10 +49,8 @@ ego_policy = PPOActor(args, env.observation_space, env.action_space, device=torc
 enm_policy = PPOActor(args, env.observation_space, env.action_space, device=torch.device("cuda"))
 ego_policy.eval() # 设置为验证模式，不使用Dropout和BatchNorm，相当于.train(False)
 enm_policy.eval()
-#ego_policy.load_state_dict(torch.load(ego_run_dir + f"/actor_{ego_policy_index}.pt")) # 将预训练的参数权重加载到新的模型之中
-#enm_policy.load_state_dict(torch.load(enm_run_dir + f"/actor_{enm_policy_index}.pt"))
-ego_policy.load_state_dict(torch.load(ego_run_dir + "/actor_latest.pt"))
-enm_policy.load_state_dict(torch.load(enm_run_dir + "/actor_latest.pt"))
+ego_policy.load_state_dict(torch.load(model_args.ego_actor))
+enm_policy.load_state_dict(torch.load(model_args.enemy_actor))
 
 
 print("Start render")
