@@ -40,5 +40,5 @@ CUDA_VISIBLE_DEVICES=0 python train/train_jsbsim.py \
     --use-eval --heading-first-target \
     --eval-interval 10 --eval-episodes 32 --n-eval-rollout-threads 4 \
     --heading-error-limits 10 200 \
-    --heading-target-pass-rate 0.9 --heading-target-eval-seed 2026 \
+    --heading-target-pass-rate 0.75 --heading-target-eval-seed 2026 \
     --user-name sf
