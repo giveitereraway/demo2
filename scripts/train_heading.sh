@@ -1,6 +1,8 @@
 #!/bin/sh
+# 纯 PPO（单帧 MLP）：sh scripts/train_heading.sh clip mlp
 # PPO + GRU：sh scripts/train_heading.sh clip gru
 # PPO + 注意力：sh scripts/train_heading.sh clip temporal_attention
+# SPO（单帧 MLP）：sh scripts/train_heading.sh spo mlp
 # SPO + GRU：sh scripts/train_heading.sh spo gru
 # SPO + 注意力：sh scripts/train_heading.sh spo temporal_attention
 
@@ -13,6 +15,9 @@ exp="heading_${loss}_${encoder}"
 
 
 case "$encoder" in
+    mlp)
+        set -- --hidden-size "128 128"
+        ;;
     gru)
         set -- --hidden-size "128 128" \
             --recurrent-hidden-size 128 --recurrent-hidden-layers 1 \
@@ -22,7 +27,7 @@ case "$encoder" in
         set -- --history-length 16 --attention-hidden-size 128 --attention-heads 4
         ;;
     *)
-        echo "编码器须为 gru 或 temporal_attention" >&2
+        echo "编码器须为 mlp、gru 或 temporal_attention" >&2
         exit 1
         ;;
 esac

@@ -1,6 +1,8 @@
 #!/bin/sh
+# 纯 PPO（单帧 MLP）：sh train_selfplay.sh ppo-mlp
 # PPO + GRU：	sh train_selfplay.sh ppo-gru
 # PPO + 注意力：sh train_selfplay.sh ppo-attention
+# SPO（单帧 MLP）：sh train_selfplay.sh spo-mlp
 # SPO + GRU：sh train_selfplay.sh spo-gru
 # SPO + 注意力：	sh train_selfplay.sh spo-attention
 
@@ -10,6 +12,11 @@ algo="ppo"
 seed=1
 
 case "${1:-ppo-attention}" in
+    ppo-mlp)
+        policy_loss="clip"
+        exp="1v1_ppo_mlp_d128_2e8"
+        set -- --memory-encoder mlp --hidden-size "128 128"
+        ;;
     ppo-gru)
         policy_loss="clip"
         exp="1v1_ppo_gru_d128_2e8"
@@ -22,6 +29,11 @@ case "${1:-ppo-attention}" in
         exp="1v1_ppo_attention_h16_d128_2e8"
         set -- --memory-encoder temporal_attention \
             --history-length 16 --attention-hidden-size 128 --attention-heads 4
+        ;;
+    spo-mlp)
+        policy_loss="spo"
+        exp="1v1_spo_mlp_d128_2e8"
+        set -- --memory-encoder mlp --hidden-size "128 128"
         ;;
     spo-gru)
         policy_loss="spo"
@@ -37,7 +49,7 @@ case "${1:-ppo-attention}" in
             --history-length 16 --attention-hidden-size 128 --attention-heads 4
         ;;
     *)
-        echo "用法：$0 {ppo-gru|ppo-attention|spo-gru|spo-attention}" >&2
+        echo "用法：$0 {ppo-mlp|ppo-gru|ppo-attention|spo-mlp|spo-gru|spo-attention}" >&2
         exit 2
         ;;
 esac

@@ -231,6 +231,59 @@ def plot_summaries(summaries: list[dict], output_dir: Path) -> None:
         plt.close(fig)
 
 
+def plot_mean_reward_comparison(summaries: list[dict], output_dir: Path) -> None:
+    """比较不同模型在 E0–E3 的平均单局累计奖励。"""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    styles = {
+        "ppo-gru": ("PPO+GRU", "o", "-", "tab:blue"),
+        "ppo-attention": ("PPO+注意力", "s", "--", "tab:orange"),
+        "spo-gru": ("SPO+GRU", "^", "-.", "tab:green"),
+        "spo-attention": ("SPO+注意力", "D", ":", "tab:red"),
+    }
+    conditions = ROBUSTNESS_CONDITION_IDS
+    rewards = {
+        (row["model"], row["condition"]): float(row["episode_reward_mean"])
+        for row in summaries if row["condition"] in conditions
+    }
+    models = {model for model, _ in rewards}
+    with plt.rc_context():
+        heading.configure_matplotlib_chinese_font()
+        fig, ax = plt.subplots(figsize=(9, 5), layout="constrained")
+        for model, (label, marker, linestyle, color) in styles.items():
+            if model in models:
+                values = [rewards[model, condition] for condition in conditions]
+                ax.plot(conditions, values, label=label, marker=marker, linestyle=linestyle, color=color)
+
+        ax.set_title("不同算法的平均奖励对比")
+        ax.set_xlabel("观测退化条件")
+        ax.set_ylabel("平均单局累计奖励")
+        ax.set_xlim(-0.18, len(conditions) - 0.62)
+        ax.margins(y=0.23)
+        ax.grid(axis="y", alpha=0.25)
+        ax.legend(loc="lower left", ncols=2)
+
+        # 同一条件内按奖励从低到高排布标签，保留每个数据点的真实坐标。
+        bottom, top = ax.get_ylim()
+        label_gap = (top - bottom) * 0.045
+        for index in range(len(conditions)):
+            points = sorted((line.get_ydata()[index], line.get_color()) for line in ax.lines)
+            label_y = bottom
+            for reward, color in points:
+                label_y = max(reward, label_y + label_gap)
+                ax.annotate(
+                    f"{reward:.2f}", xy=(index, reward), xytext=(index + 0.10, label_y),
+                    color=color, fontsize=9, va="center",
+                    bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.88, "pad": 0.8},
+                    arrowprops={"arrowstyle": "-", "color": color, "lw": 0.65},
+                )
+        fig.savefig(output_dir / "mean_reward_comparison.png", dpi=PLOT_DPI)
+        plt.close(fig)
+
+
 def plot_reward_curves(model_dir: Path, memory_encoder: str) -> None:
     """从单个模型的逐局 CSV 绘制两张奖励曲线图。"""
     import matplotlib
@@ -345,6 +398,7 @@ def main() -> None:
 
     if not args.no_plots:
         plot_summaries(summaries, output_dir)
+        plot_mean_reward_comparison(summaries, output_dir)
         for name, (_, actor) in models.items():
             plot_reward_curves(output_dir / name, actor.memory_encoder)
     print(f"完成：{output_dir / 'summary.csv'}")
