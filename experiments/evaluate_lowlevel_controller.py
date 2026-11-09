@@ -9,6 +9,8 @@
 1、读取底层模型, 初始状态随机(20个seed)
 2、指令集是高层模型映射下来的输入, 共45种指令
 3、20✖45=900个 episode, 每个episode最多跑30秒, 如果 episode 内无物理越界且末端误差满足阈值，则认为成功。
+
+使用 --fixed-sequence 时，每个种子飞行一次，连续执行 4 段各 30 秒的指令。
 """
 
 from __future__ import annotations
@@ -20,7 +22,8 @@ import math
 import random
 import sys
 from collections import defaultdict
-from dataclasses import dataclass
+from collections.abc import Iterator
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -105,24 +108,59 @@ class Command:
     delta_velocity_mps: float
 
 
+FIXED_SEQUENCE_STAGE_SEC = 30.0
+# 指令偏移统一相对同一回合的初始状态。
+FIXED_SEQUENCE = (
+    ("level_hold", Command(0.0, 0.0, 0.0)),
+    ("turn_and_climb", Command(100.0, 15.0, 0.0)),
+    ("reverse_turn_and_slow", Command(100.0, -15.0, -17.0)),
+    ("recover_level", Command(0.0, 0.0, 0.0)),
+)
+
+
+@dataclass(frozen=True)
+class CommandStage:
+    name: str | None
+    command: Command
+    target_info: dict[str, float]
+    start_step: int
+    end_step: int
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="评估 GRU 或时序注意力模型对航向、高度、速度指令的跟踪效果。"
     )
     parser.add_argument("--model-path", type=Path, required=True,
                         help="actor 权重文件，模型配置 model_config.json 与权重放在同一目录。")
-    parser.add_argument("--output-dir", type=Path, default=OUTPUT_DIR)
+    parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--scenario-name", type=str, default=SCENARIO_NAME)
-    parser.add_argument("--horizon-sec", type=float, default=HORIZON_SEC)
+    parser.add_argument("--horizon-sec", type=float, help="单指令模式的回合时长，默认 30 秒。")
     parser.add_argument("--num-seeds", type=int, default=len(SEEDS))
+    add_fixed_sequence_argument(parser)
     parser.add_argument("--no-timeseries", action="store_true")
     parser.add_argument("--no-plots", action="store_true")
     parser.add_argument(
         "--quick",
         action="store_true",
-        help="只跑 1 个 seed 和少量指令，用于快速检查脚本是否能启动。",
+        help="只跑 1 个种子，单指令模式只评估 3 条指令。",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.fixed_sequence and args.horizon_sec is not None:
+        parser.error("--horizon-sec 仅适用于单指令模式")
+    if args.horizon_sec is None:
+        args.horizon_sec = HORIZON_SEC
+    if args.output_dir is None:
+        args.output_dir = OUTPUT_DIR / "fixed_sequence" if args.fixed_sequence else OUTPUT_DIR
+    return args
+
+
+def add_fixed_sequence_argument(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--fixed-sequence",
+        action="store_true",
+        help="每个种子飞行一次，依次执行平飞保持、转弯爬升、反向转弯并减速、恢复平飞，每段 30 秒。",
+    )
 
 
 def set_random_seed(seed: int) -> None:
@@ -200,16 +238,26 @@ def _clip_target(value: float, lower: float, upper: float) -> float:
     return float(min(max(value, lower), upper))
 
 
-def set_command_target(env: SingleControlEnv, command: Command) -> dict[str, float]:
+def set_command_target(
+    env: SingleControlEnv, command: Command, reference: dict[str, float] | None = None
+) -> dict[str, float]:
     sim = env.agents[AGENT_ID]
     current_heading_deg = sim.get_property_value(c.attitude_psi_deg)
     current_altitude_ft = sim.get_property_value(c.position_h_sl_ft)
     current_altitude_m = sim.get_property_value(c.position_h_sl_m)
     current_speed_mps = sim.get_property_value(c.velocities_u_mps)
 
-    target_heading_deg = (current_heading_deg + command.delta_heading_deg) % 360.0
-    target_altitude_m = current_altitude_m + command.delta_altitude_m
-    target_speed_mps = current_speed_mps + command.delta_velocity_mps
+    if reference is None:
+        reference_heading_deg = current_heading_deg
+        reference_altitude_m = current_altitude_m
+        reference_speed_mps = current_speed_mps
+    else:
+        reference_heading_deg = reference["initial_heading_deg"]
+        reference_altitude_m = reference["initial_altitude_m"]
+        reference_speed_mps = reference["initial_speed_mps"]
+    target_heading_deg = (reference_heading_deg + command.delta_heading_deg) % 360.0
+    target_altitude_m = reference_altitude_m + command.delta_altitude_m
+    target_speed_mps = reference_speed_mps + command.delta_velocity_mps
 
     if CLAMP_TARGETS_TO_SAFE_RANGE:
         target_altitude_m = _clip_target(
@@ -233,10 +281,51 @@ def set_command_target(env: SingleControlEnv, command: Command) -> dict[str, flo
         "target_heading_deg": target_heading_deg,
         "target_altitude_m": target_altitude_m,
         "target_speed_mps": target_speed_mps,
-        "actual_delta_heading_deg": command.delta_heading_deg,
+        "actual_delta_heading_deg": (
+            (target_heading_deg - current_heading_deg + 180.0) % 360.0 - 180.0
+            if reference is not None else command.delta_heading_deg
+        ),
         "actual_delta_altitude_m": target_altitude_m - current_altitude_m,
         "actual_delta_velocity_mps": target_speed_mps - current_speed_mps,
     }
+
+
+def fixed_sequence_horizon_steps(env: SingleControlEnv) -> int:
+    stage_steps = math.ceil(FIXED_SEQUENCE_STAGE_SEC / env.time_interval)
+    horizon_steps = stage_steps * len(FIXED_SEQUENCE)
+    if horizon_steps > env.config.max_steps:
+        raise ValueError(f"场景最多允许 {env.config.max_steps} 步，固定序列需要 {horizon_steps} 步")
+    return horizon_steps
+
+
+def fixed_sequence_config(horizon_steps: int, time_interval: float) -> dict[str, Any]:
+    stage_steps = horizon_steps // len(FIXED_SEQUENCE)
+    return {
+        "target_reference": "episode_initial_state",
+        "stage_duration_sec": stage_steps * time_interval,
+        "stage_steps": stage_steps,
+        "stages": [
+            {"name": name, "start_sec": idx * stage_steps * time_interval, **asdict(command)}
+            for idx, (name, command) in enumerate(FIXED_SEQUENCE)
+        ],
+    }
+
+
+def iter_command_stages(
+    env: SingleControlEnv, command: Command | None, horizon_steps: int
+) -> Iterator[CommandStage]:
+    """逐段下发目标；command 为空时使用固定序列。"""
+    if command is not None:
+        yield CommandStage(None, command, set_command_target(env, command), 0, horizon_steps)
+        return
+
+    stage_steps = horizon_steps // len(FIXED_SEQUENCE)
+    reference = None
+    for idx, (name, stage_command) in enumerate(FIXED_SEQUENCE):
+        target_info = set_command_target(env, stage_command, reference)
+        if reference is None:
+            reference = target_info
+        yield CommandStage(name, stage_command, target_info, idx * stage_steps, (idx + 1) * stage_steps)
 
 
 def get_state_record(env: SingleControlEnv) -> dict[str, Any]:
@@ -314,7 +403,7 @@ def compute_settling_time(records: list[dict[str, Any]], window_steps: int) -> f
 def summarize_episode(
     trial_id: int,
     seed: int,
-    command: Command,
+    command: Command | None,
     target_info: dict[str, float],
     records: list[dict[str, Any]],
     controls: list[np.ndarray],
@@ -338,8 +427,16 @@ def summarize_episode(
         smoothness_l2 = 0.0
         per_channel = np.zeros(4, dtype=np.float64)
 
-    window_steps = max(1, int(math.ceil(SETTLING_WINDOW_SEC / time_interval)))
-    settling_time = compute_settling_time(records, window_steps)
+    command_fields = {}
+    settling_time = None
+    if command is not None:
+        command_fields = {
+            "requested_delta_altitude_m": command.delta_altitude_m,
+            "requested_delta_heading_deg": command.delta_heading_deg,
+            "requested_delta_velocity_mps": command.delta_velocity_mps,
+        }
+        window_steps = max(1, math.ceil(SETTLING_WINDOW_SEC / time_interval))
+        settling_time = compute_settling_time(records, window_steps)
     success = (
         abs(last_record["heading_error_deg"]) <= SUCCESS_HEADING_DEG
         and abs(last_record["altitude_error_m"]) <= SUCCESS_ALTITUDE_M
@@ -350,9 +447,7 @@ def summarize_episode(
     row: dict[str, Any] = {
         "trial_id": trial_id,
         "seed": seed,
-        "requested_delta_altitude_m": command.delta_altitude_m,
-        "requested_delta_heading_deg": command.delta_heading_deg,
-        "requested_delta_velocity_mps": command.delta_velocity_mps,
+        **command_fields,
         **target_info,
         "num_steps": len(records),
         "duration_sec": float(records[-1]["time_sec"]) if records else 0.0,
@@ -391,19 +486,64 @@ def summarize_episode(
     return row
 
 
+def summarize_trial(
+    trial_id: int,
+    seed: int,
+    stages: list[CommandStage],
+    records: list[dict[str, Any]],
+    controls: list[np.ndarray],
+    done: bool,
+    time_interval: float,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    first = stages[0]
+    if first.name is None:
+        return summarize_episode(
+            trial_id, seed, first.command, first.target_info, records, controls, done, time_interval
+        ), []
+
+    stage_rows = []
+    for idx, stage in enumerate(stages, start=1):
+        start, end = stage.start_step, stage.end_step
+        stage_records = records[start:end]
+        row = summarize_episode(
+            trial_id, seed, stage.command, stage.target_info, stage_records, controls[start:end],
+            done and idx == len(stages), time_interval,
+        )
+        start_sec = start * time_interval
+        complete = len(stage_records) == end - start
+        row["duration_sec"] = len(stage_records) * time_interval
+        if row["settling_time_sec"] is not None:
+            row["settling_time_sec"] -= start_sec
+        row["success"] = row["success"] and complete
+        stage_rows.append({
+            "stage_index": idx,
+            "stage_name": stage.name,
+            "stage_start_sec": start_sec,
+            "stage_complete": complete,
+            **row,
+        })
+
+    episode = summarize_episode(trial_id, seed, None, {}, records, controls, done, time_interval)
+    episode["completed_stages"] = sum(row["stage_complete"] for row in stage_rows)
+    episode["success"] = len(stage_rows) == len(FIXED_SEQUENCE) and all(row["success"] for row in stage_rows)
+    return episode, stage_rows
+
+
 def run_trial(
     env: SingleControlEnv,
     actor: PPOActor,
     trial_id: int,
     seed: int,
-    command: Command,
+    command: Command | None,
     horizon_steps: int,
     device: torch.device,
-) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
     set_random_seed(seed)
     env.seed(seed)
     env.reset()
-    target_info = set_command_target(env, command)
+    schedule = iter_command_stages(env, command, horizon_steps)
+    stage = next(schedule)
+    stages = [stage]
 
     policy_state = np.zeros((1, *actor.state_shape), dtype=np.float32)
     masks = np.ones((1, 1), dtype=np.float32)
@@ -412,6 +552,10 @@ def run_trial(
     done = False
 
     for step_idx in range(horizon_steps):
+        if step_idx == stage.end_step:
+            stage = next(schedule)
+            stages.append(stage)
+        target_info = stage.target_info
         obs = env.task.get_obs(env, AGENT_ID).astype(np.float32)
         obs = np.expand_dims(obs, axis=0)
         with torch.no_grad():
@@ -435,9 +579,9 @@ def run_trial(
                 "trial_id": trial_id,
                 "seed": seed,
                 "step": step_idx + 1,
-                "requested_delta_altitude_m": command.delta_altitude_m,
-                "requested_delta_heading_deg": command.delta_heading_deg,
-                "requested_delta_velocity_mps": command.delta_velocity_mps,
+                "requested_delta_altitude_m": stage.command.delta_altitude_m,
+                "requested_delta_heading_deg": stage.command.delta_heading_deg,
+                "requested_delta_velocity_mps": stage.command.delta_velocity_mps,
                 "actual_delta_altitude_m": target_info["actual_delta_altitude_m"],
                 "actual_delta_heading_deg": target_info["actual_delta_heading_deg"],
                 "actual_delta_velocity_mps": target_info["actual_delta_velocity_mps"],
@@ -451,22 +595,24 @@ def run_trial(
                 "throttle_cmd": float(continuous_action[3]),
             }
         )
+        if stage.name is not None:
+            record.update({
+                "stage_index": len(stages),
+                "stage_name": stage.name,
+                "stage_start_sec": stage.start_step * env.time_interval,
+                "target_heading_deg": target_info["target_heading_deg"],
+                "target_altitude_m": target_info["target_altitude_m"],
+                "target_speed_mps": target_info["target_speed_mps"],
+            })
         records.append(record)
         if done:
             break
 
-    episode_row = summarize_episode(
-        trial_id=trial_id,
-        seed=seed,
-        command=command,
-        target_info=target_info,
-        records=records,
-        controls=controls,
-        done=done,
-        time_interval=env.time_interval,
+    episode_row, stage_rows = summarize_trial(
+        trial_id, seed, stages, records, controls, done, env.time_interval
     )
     _ = device
-    return episode_row, records
+    return episode_row, records, stage_rows
 
 
 def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
@@ -551,8 +697,9 @@ def write_summary(path: Path, rows: list[dict[str, Any]], config: dict[str, Any]
     summary = {
         "config": config,
         "overall": summarize_rows(rows),
-        "by_command": summarize_by_command(rows),
     }
+    if "fixed_sequence" not in config:
+        summary["by_command"] = summarize_by_command(rows)
     with path.open("w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2, default=_to_jsonable)
 
@@ -611,6 +758,7 @@ def plot_timeseries(timeseries_rows: list[dict[str, Any]], output_dir: Path) -> 
         by_step[int(row["step"])].append(row)
     steps = sorted(by_step.keys())
     times = np.array([np.median([item["time_sec"] for item in by_step[step]]) for step in steps])
+    switches = sorted({row["stage_start_sec"] for row in timeseries_rows if row.get("stage_index", 1) > 1})
 
     error_specs = [
         ("heading_error_deg", "航向误差 abs(deg)"),
@@ -628,6 +776,8 @@ def plot_timeseries(timeseries_rows: list[dict[str, Any]], output_dir: Path) -> 
         q75 = np.array([np.percentile(v, 75) for v in values])
         ax.plot(times, median, label="median")
         ax.fill_between(times, q25, q75, alpha=0.25, label="25%-75%")
+        for switch in switches:
+            ax.axvline(switch, color="0.5", linestyle="--", linewidth=1)
         ax.set_ylabel(label)
         ax.grid(True, alpha=0.3)
         ax.legend(loc="best")
@@ -651,6 +801,8 @@ def plot_timeseries(timeseries_rows: list[dict[str, Any]], output_dir: Path) -> 
             ]
         )
         ax.plot(times, median, label=label)
+    for switch in switches:
+        ax.axvline(switch, color="0.5", linestyle="--", linewidth=1)
     ax.set_xlabel("时间 (s)")
     ax.set_ylabel("连续控制量")
     ax.grid(True, alpha=0.3)
@@ -668,51 +820,59 @@ def run_evaluation(args: argparse.Namespace) -> None:
     seeds = SEEDS[: max(1, args.num_seeds)]
     if args.quick:
         seeds = seeds[:1]
-    commands = build_commands(quick=args.quick)
+    commands = [None] if args.fixed_sequence else build_commands(quick=args.quick)
     device = torch.device(DEVICE)
     actor = build_actor(model_path, device)
     env = SingleControlEnv(args.scenario_name)
-    horizon_steps = max(1, int(math.ceil(args.horizon_sec / env.time_interval)))
     total_trials = len(seeds) * len(commands)
-
-    config = {
-        "model_path": str(model_path),
-        "scenario_name": args.scenario_name,
-        "output_dir": str(output_dir),
-        "seeds": seeds,
-        "horizon_sec": args.horizon_sec,
-        "horizon_steps": horizon_steps,
-        "time_interval_sec": env.time_interval,
-        "commands": [command.__dict__ for command in commands],
-        "success_thresholds": {
-            "heading_deg": SUCCESS_HEADING_DEG,
-            "altitude_m": SUCCESS_ALTITUDE_M,
-            "speed_mps": SUCCESS_SPEED_MPS,
-        },
-        "clamp_targets_to_safe_range": CLAMP_TARGETS_TO_SAFE_RANGE,
-        "write_timeseries": not args.no_timeseries and WRITE_TIMESERIES,
-        "make_plots": not args.no_plots and MAKE_PLOTS,
-    }
-
-    print(f"模型: {model_path}")
-    print(f"输出目录: {output_dir}")
-    print(f"总实验数: {total_trials} = {len(seeds)} seeds x {len(commands)} commands")
-
     episode_rows: list[dict[str, Any]] = []
     timeseries_rows: list[dict[str, Any]] = []
+    stage_rows: list[dict[str, Any]] = []
     trial_id = 0
     try:
+        horizon_steps = (
+            fixed_sequence_horizon_steps(env) if args.fixed_sequence
+            else max(1, math.ceil(args.horizon_sec / env.time_interval))
+        )
+        config = {
+            "model_path": str(model_path),
+            "scenario_name": args.scenario_name,
+            "output_dir": str(output_dir),
+            "seeds": seeds,
+            "horizon_sec": horizon_steps * env.time_interval if args.fixed_sequence else args.horizon_sec,
+            "horizon_steps": horizon_steps,
+            "time_interval_sec": env.time_interval,
+            "success_thresholds": {
+                "heading_deg": SUCCESS_HEADING_DEG,
+                "altitude_m": SUCCESS_ALTITUDE_M,
+                "speed_mps": SUCCESS_SPEED_MPS,
+            },
+            "clamp_targets_to_safe_range": CLAMP_TARGETS_TO_SAFE_RANGE,
+            "write_timeseries": not args.no_timeseries and WRITE_TIMESERIES,
+            "make_plots": not args.no_plots and MAKE_PLOTS,
+        }
+        if args.fixed_sequence:
+            config["fixed_sequence"] = fixed_sequence_config(horizon_steps, env.time_interval)
+        else:
+            config["commands"] = [asdict(command) for command in commands]
+
+        print(f"模型: {model_path}")
+        print(f"输出目录: {output_dir}")
+        trial_kind = "固定序列" if args.fixed_sequence else "单指令"
+        print(f"总实验数: {total_trials} = {len(seeds)} 个种子 × {len(commands)} 条{trial_kind}")
         for seed in seeds:
             for command in commands:
                 trial_id += 1
                 if PRINT_EACH_TRIAL:
-                    print(
-                        f"[{trial_id}/{total_trials}] seed={seed}, "
-                        f"dh={command.delta_altitude_m:+.0f}m, "
-                        f"dpsi={command.delta_heading_deg:+.0f}deg, "
-                        f"dv={command.delta_velocity_mps:+.0f}m/s"
-                    )
-                episode_row, trial_records = run_trial(
+                    label = f"[{trial_id}/{total_trials}] seed={seed}"
+                    if command is not None:
+                        label += (
+                            f", dh={command.delta_altitude_m:+.0f}m, "
+                            f"dpsi={command.delta_heading_deg:+.0f}deg, "
+                            f"dv={command.delta_velocity_mps:+.0f}m/s"
+                        )
+                    print(label)
+                episode_row, trial_records, trial_stages = run_trial(
                     env=env,
                     actor=actor,
                     trial_id=trial_id,
@@ -722,12 +882,15 @@ def run_evaluation(args: argparse.Namespace) -> None:
                     device=device,
                 )
                 episode_rows.append(episode_row)
+                stage_rows.extend(trial_stages)
                 if config["write_timeseries"]:
                     timeseries_rows.extend(trial_records)
     finally:
         env.close()
 
     write_csv(output_dir / "episodes.csv", episode_rows)
+    if args.fixed_sequence:
+        write_csv(output_dir / "stages.csv", stage_rows)
     if config["write_timeseries"]:
         write_csv(output_dir / "timeseries.csv", timeseries_rows)
     write_summary(output_dir / "summary.json", episode_rows, config)

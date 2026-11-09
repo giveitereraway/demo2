@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""用固定阶跃指令评估 heading 策略的观测退化鲁棒性和历史依赖。
+"""用单条阶跃指令或固定指令序列评估 heading 策略的观测退化鲁棒性和历史依赖。
 
 传入一个或多个 actor 权重文件，也可传入包含 actor_latest.pt 的单次训练目录。
 注意力权重需要同目录的 model_config.json。PPO/SPO 标签由模型参数指定，
@@ -9,7 +9,6 @@
 from __future__ import annotations
 
 import argparse
-import csv
 import math
 import sys
 from collections import deque
@@ -25,15 +24,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from experiments import evaluate_lowlevel_controller as heading
-from experiments.partial_observability_gru_eval import (
-    GRU_HISTORY_CONDITION_IDS as MEMORY_CONDITION_IDS,
-    PLOT_DPI,
-    REWARD_MOVING_AVERAGE_WINDOW,
-    ROBUSTNESS_CONDITION_IDS,
-    save_csv,
-    save_json,
-    trailing_moving_average,
-)
+from experiments.partial_observability_gru_eval import save_csv, save_json
 
 
 MODEL_ENCODERS = {
@@ -113,7 +104,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=OUTPUT_ROOT, help="结果根目录")
     parser.add_argument("--num-seeds", type=int, default=len(heading.SEEDS), help="初始状态种子数")
     parser.add_argument("--device", default="auto", help="auto、cpu 或 cuda:0 等")
-    parser.add_argument("--quick", action="store_true", help="使用 1 个种子和 3 条指令跑完 E0–E6")
+    heading.add_fixed_sequence_argument(parser)
+    parser.add_argument("--quick", action="store_true", help="用 1 个种子跑完 E0–E6，单指令模式评估 3 条指令")
     parser.add_argument("--no-plots", action="store_true", help="仅输出表格和配置")
     args = parser.parse_args()
     args.models = {
@@ -150,13 +142,15 @@ def run_trial(
     condition: Condition,
     trial_id: int,
     seed: int,
-    command: heading.Command,
+    command: heading.Command | None,
     horizon_steps: int,
     device: torch.device,
-) -> dict:
+) -> tuple[dict, list[dict]]:
     env.seed(seed)
     env.reset()
-    target_info = heading.set_command_target(env, command)
+    schedule = heading.iter_command_stages(env, command, horizon_steps)
+    stage = next(schedule)
+    stages = [stage]
     obs = env.task.get_obs(env, heading.AGENT_ID).astype(np.float32)
     degrader = None
     if condition.degradation is not None:
@@ -173,6 +167,11 @@ def run_trial(
     done = False
     interval = condition.reset_interval
     for step in range(horizon_steps):
+        if step == stage.end_step:
+            stage = next(schedule)
+            stages.append(stage)
+            # 切换后立即计算新目标误差，沿用当前回合的退化队列。
+            obs = env.task.get_obs(env, heading.AGENT_ID).astype(np.float32)
         if interval is not None and step % interval == 0 and (step > 0 or interval == 1):
             # 注意力的历史状态包括有效位。清空旧帧后，actor 仍会纳入本步观测。
             state.zero_()
@@ -189,14 +188,14 @@ def run_trial(
         if done:
             break
 
-    row = heading.summarize_episode(
-        trial_id, seed, command, target_info, records, controls, done, env.time_interval
+    row, stage_rows = heading.summarize_trial(
+        trial_id, seed, stages, records, controls, done, env.time_interval
     )
     row["success"] = row["success"] and len(records) == horizon_steps
     row["episode_reward"] = episode_reward
     row["memory_reset_count"] = reset_count
     row["actual_dropout_rate"] = degrader.dropped_frames / len(records) if degrader else 0.0
-    return row
+    return row, stage_rows
 
 
 def plot_summaries(summaries: list[dict], output_dir: Path) -> None:
@@ -213,8 +212,8 @@ def plot_summaries(summaries: list[dict], output_dir: Path) -> None:
     }
     models = dict.fromkeys(row["model"] for row in summaries)
     for filename, conditions in (
-        ("observation_degradation.png", ROBUSTNESS_CONDITION_IDS),
-        ("memory_ablation.png", MEMORY_CONDITION_IDS),
+        ("observation_degradation.png", ("E0", "E1", "E2", "E3")),
+        ("memory_ablation.png", ("E0", "E4", "E5", "E6")),
     ):
         fig, axes = plt.subplots(2, 2, figsize=(9, 6), layout="constrained")
         for ax, (metric, label) in zip(axes.flat, metrics.items()):
@@ -231,101 +230,6 @@ def plot_summaries(summaries: list[dict], output_dir: Path) -> None:
         plt.close(fig)
 
 
-def plot_mean_reward_comparison(summaries: list[dict], output_dir: Path) -> None:
-    """比较不同模型在 E0–E3 的平均单局累计奖励。"""
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    styles = {
-        "ppo-gru": ("PPO+GRU", "o", "-", "tab:blue"),
-        "ppo-attention": ("PPO+注意力", "s", "--", "tab:orange"),
-        "spo-gru": ("SPO+GRU", "^", "-.", "tab:green"),
-        "spo-attention": ("SPO+注意力", "D", ":", "tab:red"),
-    }
-    conditions = ROBUSTNESS_CONDITION_IDS
-    rewards = {
-        (row["model"], row["condition"]): float(row["episode_reward_mean"])
-        for row in summaries if row["condition"] in conditions
-    }
-    models = {model for model, _ in rewards}
-    with plt.rc_context():
-        heading.configure_matplotlib_chinese_font()
-        fig, ax = plt.subplots(figsize=(9, 5), layout="constrained")
-        for model, (label, marker, linestyle, color) in styles.items():
-            if model in models:
-                values = [rewards[model, condition] for condition in conditions]
-                ax.plot(conditions, values, label=label, marker=marker, linestyle=linestyle, color=color)
-
-        ax.set_title("不同算法的平均奖励对比")
-        ax.set_xlabel("观测退化条件")
-        ax.set_ylabel("平均单局累计奖励")
-        ax.set_xlim(-0.18, len(conditions) - 0.62)
-        ax.margins(y=0.23)
-        ax.grid(axis="y", alpha=0.25)
-        ax.legend(loc="lower left", ncols=2)
-
-        # 同一条件内按奖励从低到高排布标签，保留每个数据点的真实坐标。
-        bottom, top = ax.get_ylim()
-        label_gap = (top - bottom) * 0.045
-        for index in range(len(conditions)):
-            points = sorted((line.get_ydata()[index], line.get_color()) for line in ax.lines)
-            label_y = bottom
-            for reward, color in points:
-                label_y = max(reward, label_y + label_gap)
-                ax.annotate(
-                    f"{reward:.2f}", xy=(index, reward), xytext=(index + 0.10, label_y),
-                    color=color, fontsize=9, va="center",
-                    bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.88, "pad": 0.8},
-                    arrowprops={"arrowstyle": "-", "color": color, "lw": 0.65},
-                )
-        fig.savefig(output_dir / "mean_reward_comparison.png", dpi=PLOT_DPI)
-        plt.close(fig)
-
-
-def plot_reward_curves(model_dir: Path, memory_encoder: str) -> None:
-    """从单个模型的逐局 CSV 绘制两张奖励曲线图。"""
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    rewards_by_condition = {}
-    for condition in CONDITIONS:
-        path = model_dir / condition.name / "episodes.csv"
-        with path.open(encoding="utf-8-sig", newline="") as stream:
-            rows = sorted(csv.DictReader(stream), key=lambda row: int(row["trial_id"]))
-        if not rows:
-            raise ValueError(f"缺少单局累计奖励数据：{path}")
-        trials = [int(row["trial_id"]) for row in rows]
-        rewards = [float(row["episode_reward"]) for row in rows]
-        rewards_by_condition[condition.name] = (trials, rewards)
-
-    memory_title = "GRU 隐状态清零" if memory_encoder == "gru" else "注意力历史帧清空"
-    groups = (
-        ("observation_degradation_reward_curves.png", "实验一：观测干扰", ROBUSTNESS_CONDITION_IDS),
-        ("memory_ablation_reward_curves.png", f"实验二：{memory_title}", MEMORY_CONDITION_IDS),
-    )
-    with plt.rc_context():
-        heading.configure_matplotlib_chinese_font()
-        colors = plt.get_cmap("tab10").colors
-        for filename, title, condition_ids in groups:
-            fig, ax = plt.subplots(figsize=(10, 5), layout="constrained")
-            for color, condition_id in zip(colors, condition_ids):
-                trials, rewards = rewards_by_condition[condition_id]
-                smoothed = trailing_moving_average(rewards, REWARD_MOVING_AVERAGE_WINDOW)
-                ax.plot(trials, rewards, color=color, alpha=0.22, linewidth=0.9)
-                ax.plot(trials, smoothed, color=color, linewidth=2.0, label=f"{condition_id} 滑动平均")
-            ax.set_title(title)
-            ax.set_xlabel("测试局数")
-            ax.set_ylabel("单局累计奖励")
-            ax.grid(alpha=0.25)
-            ax.legend(loc="lower left", title=f"{REWARD_MOVING_AVERAGE_WINDOW} 局窗口")
-            fig.savefig(model_dir / filename, dpi=PLOT_DPI)
-            plt.close(fig)
-
-
 def main() -> None:
     args = parse_args()
     device = torch.device(
@@ -337,14 +241,17 @@ def main() -> None:
         name: load_actor(path, MODEL_ENCODERS[name], device) for name, path in args.models.items()
     }
     seeds = heading.SEEDS[:1 if args.quick else args.num_seeds]
-    commands = heading.build_commands(quick=args.quick)
+    commands = [None] if args.fixed_sequence else heading.build_commands(quick=args.quick)
     trials = [(seed, command) for seed in seeds for command in commands]
     env = heading.SingleControlEnv(heading.SCENARIO_NAME)
     output_dir = args.output_dir.resolve() / datetime.now().strftime("run_%Y%m%d_%H%M%S_%f")
     summaries = []
     try:
-        horizon_steps = math.ceil(HORIZON_SEC / env.time_interval)
-        save_json({
+        horizon_steps = (
+            heading.fixed_sequence_horizon_steps(env) if args.fixed_sequence
+            else math.ceil(HORIZON_SEC / env.time_interval)
+        )
+        config = {
             "scenario": heading.SCENARIO_NAME,
             "device": str(device),
             "models": {
@@ -357,30 +264,36 @@ def main() -> None:
             },
             "seeds": seeds,
             "sensor_seed": SENSOR_SEED,
-            "commands": [asdict(command) for command in commands],
             "conditions": [asdict(condition) for condition in CONDITIONS],
-            "horizon_sec": HORIZON_SEC,
+            "horizon_sec": horizon_steps * env.time_interval if args.fixed_sequence else HORIZON_SEC,
             "step_sec": env.time_interval,
             "success_thresholds": {
                 "heading_deg": heading.SUCCESS_HEADING_DEG,
                 "altitude_m": heading.SUCCESS_ALTITUDE_M,
                 "speed_mps": heading.SUCCESS_SPEED_MPS,
             },
-        }, output_dir / "config.json")
+        }
+        if args.fixed_sequence:
+            config["fixed_sequence"] = heading.fixed_sequence_config(horizon_steps, env.time_interval)
+        else:
+            config["commands"] = [asdict(command) for command in commands]
+        save_json(config, output_dir / "config.json")
         print(f"输出目录：{output_dir}", flush=True)
         for name, (_, actor) in models.items():
             baseline = {}
             for condition in CONDITIONS:
                 print(f"{name} / {condition.name}：{len(trials)} 局", flush=True)
-                rows = [
-                    {
-                        "model": name,
-                        "condition": condition.name,
-                        **run_trial(env, actor, condition, idx, seed, command, horizon_steps, device),
-                    }
-                    for idx, (seed, command) in enumerate(trials, start=1)
-                ]
-                save_csv(rows, output_dir / name / condition.name / "episodes.csv")
+                rows = []
+                stage_rows = []
+                labels = {"model": name, "condition": condition.name}
+                for idx, (seed, command) in enumerate(trials, start=1):
+                    row, trial_stages = run_trial(env, actor, condition, idx, seed, command, horizon_steps, device)
+                    rows.append({**labels, **row})
+                    stage_rows.extend({**labels, **stage} for stage in trial_stages)
+                condition_dir = output_dir / name / condition.name
+                save_csv(rows, condition_dir / "episodes.csv")
+                if args.fixed_sequence:
+                    save_csv(stage_rows, condition_dir / "stages.csv")
                 summary = heading.summarize_rows(rows)
                 for metric in ("episode_reward", "memory_reset_count", "actual_dropout_rate"):
                     summary[f"{metric}_mean"] = float(np.mean([row[metric] for row in rows]))
@@ -398,9 +311,6 @@ def main() -> None:
 
     if not args.no_plots:
         plot_summaries(summaries, output_dir)
-        plot_mean_reward_comparison(summaries, output_dir)
-        for name, (_, actor) in models.items():
-            plot_reward_curves(output_dir / name, actor.memory_encoder)
     print(f"完成：{output_dir / 'summary.csv'}")
 
 
