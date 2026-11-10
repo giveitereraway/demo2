@@ -5,11 +5,14 @@
 # SPO（单帧 MLP）：sh scripts/train_heading.sh spo mlp
 # SPO + GRU：sh scripts/train_heading.sh spo gru
 # SPO + 注意力：sh scripts/train_heading.sh spo temporal_attention
+# 带噪训练：sh scripts/train_heading.sh clip gru noisy
+# 带噪训练：sh scripts/train_heading.sh clip temporal_attention noisy
 
 cd "$(dirname "$0")" || exit 1
 
 loss="${1:-clip}"
 encoder="${2:-temporal_attention}"
+observation="${3:-clean}"
 seed=1
 exp="heading_${loss}_${encoder}"
 
@@ -28,6 +31,19 @@ case "$encoder" in
         ;;
     *)
         echo "编码器须为 mlp、gru 或 temporal_attention" >&2
+        exit 1
+        ;;
+esac
+
+case "$observation" in
+    clean)
+        ;;
+    noisy)
+        exp="${exp}_noisy"
+        set -- "$@" --heading-measurement-noise
+        ;;
+    *)
+        echo "观测模式须为 clean 或 noisy" >&2
         exit 1
         ;;
 esac

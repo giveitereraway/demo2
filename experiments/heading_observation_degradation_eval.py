@@ -2,7 +2,7 @@
 """用单条阶跃指令或固定指令序列评估 heading 策略的观测退化鲁棒性和历史依赖。
 
 传入一个或多个 actor 权重文件，也可传入包含 actor_latest.pt 的单次训练目录。
-注意力权重需要同目录的 model_config.json。PPO/SPO 标签由模型参数指定，
+MLP 和注意力权重需要同目录的 model_config.json。PPO/SPO 标签由模型参数指定，
 两者推理都使用 PPOActor。
 """
 
@@ -12,6 +12,7 @@ import argparse
 import math
 import sys
 from collections import deque
+from contextlib import ExitStack
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
@@ -25,13 +26,16 @@ if str(REPO_ROOT) not in sys.path:
 
 from experiments import evaluate_lowlevel_controller as heading
 from experiments.partial_observability_gru_eval import save_csv, save_json
+from envs.JSBSim.envs.singlecontrol_env import HEADING_MEASUREMENT_NOISE_STD, HeadingMeasurementNoiseEnv
 
 
 MODEL_ENCODERS = {
     "ppo-gru": "gru",
     "ppo-attention": "temporal_attention",
+    "ppo-mlp": "mlp",
     "spo-gru": "gru",
     "spo-attention": "temporal_attention",
+    "spo-mlp": "mlp",
 }
 OUTPUT_ROOT = REPO_ROOT / "experiments" / "results" / "chapter_3" /"observation_degradation" / "heading_observation_degradation"
 SENSOR_SEED = 31001
@@ -65,6 +69,10 @@ CONDITIONS = (
     Condition("E4", reset_interval=20),
     Condition("E5", reset_interval=5),
     Condition("E6", reset_interval=1),
+)
+MEASUREMENT_NOISE_CONDITIONS = (
+    Condition("E0"),
+    *(Condition(f"N{level}") for level in range(1, len(HEADING_MEASUREMENT_NOISE_STD))),
 )
 
 
@@ -105,7 +113,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-seeds", type=int, default=len(heading.SEEDS), help="初始状态种子数")
     parser.add_argument("--device", default="auto", help="auto、cpu 或 cuda:0 等")
     heading.add_fixed_sequence_argument(parser)
-    parser.add_argument("--quick", action="store_true", help="用 1 个种子跑完 E0–E6，单指令模式评估 3 条指令")
+    parser.add_argument("--measurement-noise", action="store_true",
+                        help="评估干净观测和三个测量噪声档位，默认沿用 E0–E6 误差通道退化")
+    parser.add_argument("--quick", action="store_true", help="用 1 个种子评估，单指令模式评估 3 条指令")
     parser.add_argument("--no-plots", action="store_true", help="仅输出表格和配置")
     args = parser.parse_args()
     args.models = {
@@ -125,8 +135,8 @@ def load_actor(path: Path, encoder: str, device: torch.device) -> tuple[Path, he
         path = path / "actor_latest.pt"
     if not path.is_file():
         raise FileNotFoundError(f"权重文件不存在：{path}")
-    if encoder == "temporal_attention" and not path.with_name("model_config.json").is_file():
-        raise FileNotFoundError(f"注意力权重缺少同目录的 model_config.json：{path}")
+    if encoder != "gru" and not path.with_name("model_config.json").is_file():
+        raise FileNotFoundError(f"{encoder} 权重缺少同目录的 model_config.json：{path}")
     actor = heading.build_actor(path, device)
     if actor.memory_encoder != encoder:
         raise ValueError(f"模型 {path} 的编码器为 {actor.memory_encoder}，期望 {encoder}")
@@ -151,7 +161,7 @@ def run_trial(
     schedule = heading.iter_command_stages(env, command, horizon_steps)
     stage = next(schedule)
     stages = [stage]
-    obs = env.task.get_obs(env, heading.AGENT_ID).astype(np.float32)
+    obs = env.get_obs()[heading.AGENT_ID].astype(np.float32)
     degrader = None
     if condition.degradation is not None:
         # 同一试验跨模型和退化档位复用随机数流，并独立于上一回合长度。
@@ -171,7 +181,7 @@ def run_trial(
             stage = next(schedule)
             stages.append(stage)
             # 切换后立即计算新目标误差，沿用当前回合的退化队列。
-            obs = env.task.get_obs(env, heading.AGENT_ID).astype(np.float32)
+            obs = env.get_obs()[heading.AGENT_ID].astype(np.float32)
         if interval is not None and step % interval == 0 and (step > 0 or interval == 1):
             # 注意力的历史状态包括有效位。清空旧帧后，actor 仍会纳入本步观测。
             state.zero_()
@@ -198,7 +208,7 @@ def run_trial(
     return row, stage_rows
 
 
-def plot_summaries(summaries: list[dict], output_dir: Path) -> None:
+def plot_summaries(summaries: list[dict], output_dir: Path, *, measurement_noise: bool = False) -> None:
     import matplotlib
 
     matplotlib.use("Agg")
@@ -211,10 +221,13 @@ def plot_summaries(summaries: list[dict], output_dir: Path) -> None:
         "speed_mae_mps_mean": "Speed MAE (m/s)",
     }
     models = dict.fromkeys(row["model"] for row in summaries)
-    for filename, conditions in (
+    plots = (
         ("observation_degradation.png", ("E0", "E1", "E2", "E3")),
         ("memory_ablation.png", ("E0", "E4", "E5", "E6")),
-    ):
+    )
+    if measurement_noise:
+        plots = (("measurement_noise.png", tuple(condition.name for condition in MEASUREMENT_NOISE_CONDITIONS)),)
+    for filename, conditions in plots:
         fig, axes = plt.subplots(2, 2, figsize=(9, 6), layout="constrained")
         for ax, (metric, label) in zip(axes.flat, metrics.items()):
             for model in models:
@@ -243,10 +256,18 @@ def main() -> None:
     seeds = heading.SEEDS[:1 if args.quick else args.num_seeds]
     commands = [None] if args.fixed_sequence else heading.build_commands(quick=args.quick)
     trials = [(seed, command) for seed in seeds for command in commands]
-    env = heading.SingleControlEnv(heading.SCENARIO_NAME)
+    conditions = MEASUREMENT_NOISE_CONDITIONS if args.measurement_noise else CONDITIONS
     output_dir = args.output_dir.resolve() / datetime.now().strftime("run_%Y%m%d_%H%M%S_%f")
     summaries = []
-    try:
+    with ExitStack() as stack:
+        env = heading.SingleControlEnv(heading.SCENARIO_NAME)
+        stack.callback(env.close)
+        evaluation_envs = {"E0": env}
+        if args.measurement_noise:
+            for level, condition in enumerate(conditions[1:], start=1):
+                noisy_env = HeadingMeasurementNoiseEnv(heading.SCENARIO_NAME, noise_level=level, sensor_seed=SENSOR_SEED)
+                stack.callback(noisy_env.close)
+                evaluation_envs[condition.name] = noisy_env
         horizon_steps = (
             heading.fixed_sequence_horizon_steps(env) if args.fixed_sequence
             else math.ceil(HORIZON_SEC / env.time_interval)
@@ -264,7 +285,7 @@ def main() -> None:
             },
             "seeds": seeds,
             "sensor_seed": SENSOR_SEED,
-            "conditions": [asdict(condition) for condition in CONDITIONS],
+            "conditions": [asdict(condition) for condition in conditions],
             "horizon_sec": horizon_steps * env.time_interval if args.fixed_sequence else HORIZON_SEC,
             "step_sec": env.time_interval,
             "success_thresholds": {
@@ -273,6 +294,10 @@ def main() -> None:
                 "speed_mps": heading.SUCCESS_SPEED_MPS,
             },
         }
+        if args.measurement_noise:
+            config["measurement_noise_std_m_deg_mps"] = {
+                condition.name: std for condition, std in zip(conditions, HEADING_MEASUREMENT_NOISE_STD)
+            }
         if args.fixed_sequence:
             config["fixed_sequence"] = heading.fixed_sequence_config(horizon_steps, env.time_interval)
         else:
@@ -281,13 +306,15 @@ def main() -> None:
         print(f"输出目录：{output_dir}", flush=True)
         for name, (_, actor) in models.items():
             baseline = {}
-            for condition in CONDITIONS:
+            for condition in conditions:
                 print(f"{name} / {condition.name}：{len(trials)} 局", flush=True)
                 rows = []
                 stage_rows = []
                 labels = {"model": name, "condition": condition.name}
                 for idx, (seed, command) in enumerate(trials, start=1):
-                    row, trial_stages = run_trial(env, actor, condition, idx, seed, command, horizon_steps, device)
+                    row, trial_stages = run_trial(
+                        evaluation_envs.get(condition.name, env), actor, condition, idx, seed, command, horizon_steps, device,
+                    )
                     rows.append({**labels, **row})
                     stage_rows.extend({**labels, **stage} for stage in trial_stages)
                 condition_dir = output_dir / name / condition.name
@@ -306,11 +333,8 @@ def main() -> None:
                     summary[f"{metric}_change_from_e0"] = summary[metric] - baseline[metric]
                 summaries.append({"model": name, "condition": condition.name, **summary})
                 save_csv(summaries, output_dir / "summary.csv")
-    finally:
-        env.close()
-
     if not args.no_plots:
-        plot_summaries(summaries, output_dir)
+        plot_summaries(summaries, output_dir, measurement_noise=args.measurement_noise)
     print(f"完成：{output_dir / 'summary.csv'}")
 
 

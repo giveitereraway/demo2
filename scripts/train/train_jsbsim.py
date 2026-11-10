@@ -12,9 +12,17 @@ from config import get_config
 from runner.experiment_tracking import create_run_dir, track_swanlab
 from runner.share_jsbsim_runner import ShareJSBSimRunner
 from envs.JSBSim.envs import SingleCombatEnv, SingleControlEnv, MultipleCombatEnv
-from envs.JSBSim.envs.singlecontrol_env import HeadingTrackingEvalEnv
+from envs.JSBSim.envs.singlecontrol_env import (
+    HEADING_MEASUREMENT_NOISE_PROBABILITIES,
+    HEADING_MEASUREMENT_NOISE_STD,
+    HeadingMeasurementNoiseEnv,
+    HeadingTrackingEvalEnv,
+)
 from envs.env_wrappers import SubprocVecEnv, DummyVecEnv, ShareSubprocVecEnv, ShareDummyVecEnv
 from runner.tacview import Tacview
+
+HEADING_EVAL_NOISE_LEVEL = 2
+
 
 def make_train_env(all_args):
     def get_env_fn(rank):
@@ -22,7 +30,8 @@ def make_train_env(all_args):
             if all_args.env_name == "SingleCombat":
                 env = SingleCombatEnv(all_args.scenario_name)
             elif all_args.env_name == "SingleControl":
-                env = SingleControlEnv(all_args.scenario_name)
+                env_type = HeadingMeasurementNoiseEnv if all_args.heading_measurement_noise else SingleControlEnv
+                env = env_type(all_args.scenario_name)
             elif all_args.env_name == "MultipleCombat":
                 env = MultipleCombatEnv(all_args.scenario_name)
             else:
@@ -42,17 +51,19 @@ def make_train_env(all_args):
         else:
             return SubprocVecEnv([get_env_fn(i) for i in range(all_args.n_rollout_threads)])
 
-"""
-训练环境和验证环境几乎一样,只有种子设置不同,保证训练和验证的独立性
-"""
 def make_eval_env(all_args):
     def get_env_fn(rank):
         def init_env():
             if all_args.env_name == "SingleCombat":
                 env = SingleCombatEnv(all_args.scenario_name)
             elif all_args.env_name == "SingleControl":
-                env_type = HeadingTrackingEvalEnv if all_args.heading_first_target else SingleControlEnv
-                env = env_type(all_args.scenario_name)
+                noise_level = HEADING_EVAL_NOISE_LEVEL if all_args.heading_measurement_noise else 0
+                if all_args.heading_first_target:
+                    env = HeadingTrackingEvalEnv(all_args.scenario_name, noise_level=noise_level)
+                elif noise_level:
+                    env = HeadingMeasurementNoiseEnv(all_args.scenario_name, noise_level=noise_level)
+                else:
+                    env = SingleControlEnv(all_args.scenario_name)
             elif all_args.env_name == "MultipleCombat":
                 env = MultipleCombatEnv(all_args.scenario_name)
             else:
@@ -79,7 +90,14 @@ def parse_args(args, parser):
                        help="Which scenario to run on")
     group.add_argument('--render-mode', type=str, default='txt',
                        help="txt or real_time")
+    group.add_argument("--heading-measurement-noise", action="store_true",
+                       help="Heading 训练采样随机加测量噪声，定期评估固定使用第二档噪声")
     all_args = parser.parse_known_args(args)[0]
+    if all_args.heading_measurement_noise and (
+        (all_args.env_name, all_args.scenario_name, all_args.algorithm_name) != ("SingleControl", "1/heading", "ppo")
+        or all_args.use_selfplay
+    ):
+        parser.error("--heading-measurement-noise 仅支持 SingleControl / 1/heading 的 PPO 训练")
     if all_args.policy_loss == "spo" and (all_args.algorithm_name != "ppo"
             or all_args.env_name not in {"SingleControl", "SingleCombat"}):
         parser.error("SPO 仅支持 SingleControl / SingleCombat 的 PPO 训练，暂不支持 MAPPO / MultipleCombat")
@@ -102,12 +120,20 @@ def parse_args(args, parser):
             parser.error("达标率须在 (0, 1] 内，验证种子须为非负整数")
         if min(all_args.eval_episodes, all_args.n_eval_rollout_threads, all_args.eval_interval) < 1:
             parser.error("验证回合数、线程数和间隔须为正数")
+    if all_args.heading_measurement_noise and all_args.use_eval:
+        all_args.heading_eval_noise_std_m_deg_mps = HEADING_MEASUREMENT_NOISE_STD[HEADING_EVAL_NOISE_LEVEL]
     return all_args
 
 
 def main(args):
     parser = get_config() # 构建解析器
     all_args = parse_args(args, parser) # 解析命令行参数
+    if all_args.heading_measurement_noise:
+        logging.info("Heading 测量噪声（高度 m、航向 °、前向速度 m/s）：标准差 %s，档位概率 %s",
+                     HEADING_MEASUREMENT_NOISE_STD, HEADING_MEASUREMENT_NOISE_PROBABILITIES)
+        if all_args.use_eval:
+            logging.info("Heading 定期评估使用第二档测量噪声，标准差 %s",
+                         all_args.heading_eval_noise_std_m_deg_mps)
 
     # seed
     np.random.seed(all_args.seed) # 设置NumPy随机种子，all_args.seed固定时，每次生成的随机数一样

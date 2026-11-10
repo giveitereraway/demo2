@@ -53,11 +53,12 @@ def test_heading_rejects_invalid_limit_count(limits):
     assert error.value.code == 2
 
 
-@pytest.mark.parametrize("policy_loss", ["clip", "spo"])
-def test_heading_saves_first_target_and_finishes_training(tmp_path, policy_loss):
+@pytest.mark.parametrize("policy_loss,noisy", [("clip", False), ("spo", False), ("clip", True)])
+def test_heading_saves_first_target_and_finishes_training(tmp_path, policy_loss, noisy):
     args = parse_args([
         "--env-name", "SingleControl", "--scenario-name", "1/heading",
         "--policy-loss", policy_loss, "--use-eval", "--heading-first-target",
+        *(["--heading-measurement-noise"] if noisy else []),
         "--heading-error-limits", "180", "100000", "1000",
         "--eval-interval", "1", "--eval-episodes", "3", "--n-eval-rollout-threads", "2",
         "--n-rollout-threads", "1", "--buffer-size", "4", "--data-chunk-length", "2",
@@ -66,7 +67,7 @@ def test_heading_saves_first_target_and_finishes_training(tmp_path, policy_loss)
 
     def make_eval_env(max_steps):
         def create():
-            env = HeadingTrackingEvalEnv("1/heading")
+            env = HeadingTrackingEvalEnv("1/heading", noise_level=2 if noisy else 0)
             env.config.max_steps = max_steps
             env.task.termination_conditions[-1].max_steps = max_steps
             return env
@@ -87,6 +88,8 @@ def test_heading_saves_first_target_and_finishes_training(tmp_path, policy_loss)
         assert record["first_env_steps"] == 4
         assert record["passed_episodes"] == 3
         assert record["policy_loss"] == policy_loss
+        if noisy:
+            assert record["eval_measurement_noise_std_m_deg_mps"] == [25.0, 3.0, 3.0]
         assert runner.total_num_steps == 8
         first = torch.load(tmp_path / "actor_first_tracking_target.pt", weights_only=True)
         latest = torch.load(tmp_path / "actor_latest.pt", weights_only=True)

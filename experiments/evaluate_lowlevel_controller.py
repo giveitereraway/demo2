@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-独立评估 GRU 或时序注意力低层控制器的指令跟踪能力。
+独立评估 MLP、GRU 或时序注意力低层控制器的指令跟踪能力。
 
 实验会在 SingleControl/heading 环境中手动注入航向、高度、速度目标，
 记录真实跟踪误差、越界率和控制平滑性，结果用于支撑分层架构中
@@ -129,7 +129,7 @@ class CommandStage:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="评估 GRU 或时序注意力模型对航向、高度、速度指令的跟踪效果。"
+        description="评估 MLP、GRU 或时序注意力模型对航向、高度、速度指令的跟踪效果。"
     )
     parser.add_argument("--model-path", type=Path, required=True,
                         help="actor 权重文件，模型配置 model_config.json 与权重放在同一目录。")
@@ -194,7 +194,7 @@ def build_actor(model_path: Path, device: torch.device) -> PPOActor:
         args.activation_id = config["activation_id"]
         args.use_feature_normalization = config["use_feature_normalization"]
         args.use_prior = config["use_prior"]
-        if args.memory_encoder == "gru":
+        if args.memory_encoder in {"mlp", "gru"}:
             args.recurrent_hidden_layers, args.recurrent_hidden_size = config["state_shape"]
         elif args.memory_encoder == "temporal_attention":
             args.history_length = config["history_length"]

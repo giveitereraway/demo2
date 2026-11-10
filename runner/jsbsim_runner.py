@@ -259,6 +259,8 @@ class JSBSimRunner(Runner):
             "training_seed": args.seed,
             "policy_loss": args.policy_loss,
         }
+        if hasattr(args, "heading_eval_noise_std_m_deg_mps"):
+            record["eval_measurement_noise_std_m_deg_mps"] = args.heading_eval_noise_std_m_deg_mps
         temporary = path.with_suffix(".tmp")
         temporary.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
         temporary.replace(path)

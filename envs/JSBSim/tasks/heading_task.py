@@ -4,6 +4,7 @@ from .task_base import BaseTask
 from ..core.catalog import Catalog as c
 from ..reward_functions import AltitudeReward, HeadingReward
 from ..termination_conditions import ExtremeState, LowAltitude, Overload, Timeout, UnreachHeading
+from ..utils.utils import in_range_deg
 
 
 class HeadingTask(BaseTask):
@@ -64,7 +65,7 @@ class HeadingTask(BaseTask):
         # aileron, elevator, rudder, throttle
         self.action_space = spaces.MultiDiscrete([41, 41, 41, 30])
 
-    def get_obs(self, env, agent_id):
+    def get_obs(self, env, agent_id, *, measurement_error=None):
         """
         Convert simulation states into the format of observation_space.
 
@@ -84,6 +85,15 @@ class HeadingTask(BaseTask):
         """
         obs = np.array(env.agents[agent_id].get_property_values(self.state_var)) # 从JSBSim仿真器中获取智能体的原始状态数据
         # env.agents 实际上是 self._jsbsims 的 属性包装器
+        if measurement_error is not None:
+            # 原误差为目标减真值。减去测量偏差，等价于用目标减测量值。
+            altitude_error, heading_error, speed_error = measurement_error
+            obs[0] -= altitude_error
+            obs[1] = in_range_deg(obs[1] - heading_error)
+            obs[2] -= speed_error
+            # 高度和前向速度的直接观测与对应误差使用同一测量值。
+            obs[3] += altitude_error
+            obs[6] += speed_error
         norm_obs = np.zeros(12)
         norm_obs[0] = obs[0] / 1000         # 0. ego delta altitude (unit: 1km)
         norm_obs[1] = obs[1] / 180 * np.pi  # 1. ego delta heading  (unit rad)
