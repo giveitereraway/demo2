@@ -27,7 +27,7 @@ case "$encoder" in
             --data-chunk-length 8
         ;;
     temporal_attention)
-        set -- --history-length 16 --attention-hidden-size 128 --attention-heads 4
+        set -- --history-length 2 --attention-hidden-size 128 --attention-heads 4
         ;;
     *)
         echo "编码器须为 mlp、gru 或 temporal_attention" >&2

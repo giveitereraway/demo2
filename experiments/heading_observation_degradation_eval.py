@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""用单条阶跃指令或固定指令序列评估 heading 策略的观测退化鲁棒性和历史依赖。
+"""用单条阶跃指令或固定指令序列评估 heading 策略的观测退化鲁棒性。
 
 传入一个或多个 actor 权重文件，也可传入包含 actor_latest.pt 的单次训练目录。
 MLP 和注意力权重需要同目录的 model_config.json。PPO/SPO 标签由模型参数指定，
@@ -15,6 +15,7 @@ from collections import deque
 from contextlib import ExitStack
 from dataclasses import asdict, dataclass
 from datetime import datetime
+from itertools import cycle
 from pathlib import Path
 
 import numpy as np
@@ -56,7 +57,6 @@ class Degradation:
 class Condition:
     name: str
     degradation: Degradation | None = None
-    reset_interval: int | None = None
 
 
 # 噪声标准差按高度、航向、速度的物理单位给出。丢帧和延迟作用于整个误差向量。
@@ -66,9 +66,9 @@ CONDITIONS = (
     Condition("E1", Degradation(0.10, 1, 10.0, 1.0, 1.0)),
     Condition("E2", Degradation(0.20, 2, 25.0, 3.0, 3.0)),
     Condition("E3", Degradation(0.30, 3, 50.0, 5.0, 5.0)),
-    Condition("E4", reset_interval=20),
-    Condition("E5", reset_interval=5),
-    Condition("E6", reset_interval=1),
+    Condition("E4", Degradation(0.40, 4, 75.0, 7.0, 7.0)),
+    Condition("E5", Degradation(0.50, 5, 100.0, 9.0, 9.0)),
+    Condition("E6", Degradation(0.60, 6, 125.0, 11.0, 11.0)),
 )
 MEASUREMENT_NOISE_CONDITIONS = (
     Condition("E0"),
@@ -114,7 +114,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="auto", help="auto、cpu 或 cuda:0 等")
     heading.add_fixed_sequence_argument(parser)
     parser.add_argument("--measurement-noise", action="store_true",
-                        help="评估干净观测和三个测量噪声档位，默认沿用 E0–E6 误差通道退化")
+                        help="改为评估干净观测和三个测量噪声档位，默认评估 E0–E6 误差通道退化")
     parser.add_argument("--quick", action="store_true", help="用 1 个种子评估，单指令模式评估 3 条指令")
     parser.add_argument("--no-plots", action="store_true", help="仅输出表格和配置")
     args = parser.parse_args()
@@ -170,22 +170,16 @@ def run_trial(
 
     state = torch.zeros((1, *actor.state_shape), device=device)
     masks = torch.ones((1, 1), device=device)
-    reset_count = 0
     episode_reward = 0.0
     records = []
     controls = []
     done = False
-    interval = condition.reset_interval
     for step in range(horizon_steps):
         if step == stage.end_step:
             stage = next(schedule)
             stages.append(stage)
             # 切换后立即计算新目标误差，沿用当前回合的退化队列。
             obs = env.get_obs()[heading.AGENT_ID].astype(np.float32)
-        if interval is not None and step % interval == 0 and (step > 0 or interval == 1):
-            # 注意力的历史状态包括有效位。清空旧帧后，actor 仍会纳入本步观测。
-            state.zero_()
-            reset_count += 1
         policy_obs = degrader.transform(obs) if degrader is not None else obs
         action, _, state = actor(policy_obs[None, :], state, masks, deterministic=True)
         action = action.cpu().numpy().astype(np.int64)
@@ -203,9 +197,54 @@ def run_trial(
     )
     row["success"] = row["success"] and len(records) == horizon_steps
     row["episode_reward"] = episode_reward
-    row["memory_reset_count"] = reset_count
     row["actual_dropout_rate"] = degrader.dropped_frames / len(records) if degrader else 0.0
     return row, stage_rows
+
+
+def plot_mean_rewards(conditions: tuple[str, ...], rows_by_model: dict[str, list[dict]], output_dir: Path) -> None:
+    import matplotlib.pyplot as plt
+
+    styles = (("o", "-"), ("s", "--"), ("^", "-."), ("D", ":"), ("P", "--"), ("X", "-."), ("v", ":"))
+    with plt.rc_context():
+        heading.configure_matplotlib_chinese_font()
+        fig, ax = plt.subplots(figsize=(9, 5), layout="constrained")
+        positions = range(len(conditions))
+        series = []
+        for (model, rows), (marker, linestyle) in zip(rows_by_model.items(), cycle(styles)):
+            rewards = [row["episode_reward_mean"] for row in rows]
+            label = model.upper().replace("-", "+", 1).replace("ATTENTION", "注意力")
+            line, = ax.plot(positions, rewards, marker=marker, linestyle=linestyle, label=label)
+            series.append((rewards, line.get_color()))
+        ax.set_xticks(positions, conditions)
+        ax.set_xlim(-0.3, len(conditions) - 0.3)
+        ax.margins(y=0.12)
+        ax.set_title("不同算法的平均奖励对比")
+        ax.set_xlabel("观测退化条件")
+        ax.set_ylabel("平均单局累计奖励")
+        ax.grid(axis="y", alpha=0.25)
+        ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.17), ncols=min(3, len(series)))
+
+        # 同一档位的均值接近时，按屏幕上的字号留出间距，并用引线指回实际数值。
+        fig.canvas.draw()
+        bottom, top = ax.get_ylim()
+        gap = (top - bottom) * (15 * fig.dpi / 72) / ax.get_window_extent().height
+        for x in positions:
+            points = sorted(((rewards[x], color) for rewards, color in series), key=lambda point: point[0])
+            label_y = [max(reward, bottom + gap / 2) for reward, _ in points]
+            for i in range(1, len(label_y)):
+                label_y[i] = max(label_y[i], label_y[i - 1] + gap)
+            label_y[-1] = min(label_y[-1], top - gap / 2)
+            for i in range(len(label_y) - 2, -1, -1):
+                label_y[i] = min(label_y[i], label_y[i + 1] - gap)
+            for (reward, color), y in zip(points, label_y):
+                ax.annotate(
+                    f"{reward:.2f}", (x, reward), xytext=(x + 0.18, y),
+                    color=color, va="center", fontsize=9,
+                    bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.9, "pad": 0.3},
+                    arrowprops={"arrowstyle": "-", "color": color, "lw": 0.6},
+                ).set_in_layout(False)
+        fig.savefig(output_dir / "mean_reward_comparison.png", dpi=180)
+        plt.close(fig)
 
 
 def plot_summaries(summaries: list[dict], output_dir: Path, *, measurement_noise: bool = False) -> None:
@@ -220,27 +259,26 @@ def plot_summaries(summaries: list[dict], output_dir: Path, *, measurement_noise
         "altitude_mae_m_mean": "Altitude MAE (m)",
         "speed_mae_mps_mean": "Speed MAE (m/s)",
     }
-    models = dict.fromkeys(row["model"] for row in summaries)
-    plots = (
-        ("observation_degradation.png", ("E0", "E1", "E2", "E3")),
-        ("memory_ablation.png", ("E0", "E4", "E5", "E6")),
-    )
-    if measurement_noise:
-        plots = (("measurement_noise.png", tuple(condition.name for condition in MEASUREMENT_NOISE_CONDITIONS)),)
-    for filename, conditions in plots:
-        fig, axes = plt.subplots(2, 2, figsize=(9, 6), layout="constrained")
-        for ax, (metric, label) in zip(axes.flat, metrics.items()):
-            for model in models:
-                rows = [
-                    row for row in summaries if row["model"] == model and row["condition"] in conditions
-                ]
-                ax.plot(conditions, [row[metric] for row in rows], marker="o", label=model)
-            ax.set_ylabel(label)
-            ax.grid(alpha=0.25)
-        axes[0, 0].set_ylim(-0.02, 1.02)
-        axes[0, 0].legend()
-        fig.savefig(output_dir / filename, dpi=180)
-        plt.close(fig)
+    suite = MEASUREMENT_NOISE_CONDITIONS if measurement_noise else CONDITIONS
+    conditions = tuple(condition.name for condition in suite)
+    rows_by_key = {(row["model"], row["condition"]): row for row in summaries}
+    rows_by_model = {
+        model: [rows_by_key[model, condition] for condition in conditions]
+        for model in dict.fromkeys(row["model"] for row in summaries)
+    }
+    fig, axes = plt.subplots(2, 2, figsize=(9, 6), layout="constrained")
+    for ax, (metric, label) in zip(axes.flat, metrics.items()):
+        for model, rows in rows_by_model.items():
+            ax.plot(conditions, [row[metric] for row in rows], marker="o", label=model)
+        ax.set_ylabel(label)
+        ax.grid(alpha=0.25)
+    axes[0, 0].set_ylim(-0.02, 1.02)
+    axes[0, 0].legend()
+    filename = "measurement_noise.png" if measurement_noise else "observation_degradation.png"
+    fig.savefig(output_dir / filename, dpi=180)
+    plt.close(fig)
+    if not measurement_noise:
+        plot_mean_rewards(conditions, rows_by_model, output_dir)
 
 
 def main() -> None:
@@ -322,7 +360,7 @@ def main() -> None:
                 if args.fixed_sequence:
                     save_csv(stage_rows, condition_dir / "stages.csv")
                 summary = heading.summarize_rows(rows)
-                for metric in ("episode_reward", "memory_reset_count", "actual_dropout_rate"):
+                for metric in ("episode_reward", "actual_dropout_rate"):
                     summary[f"{metric}_mean"] = float(np.mean([row[metric] for row in rows]))
                 if condition.name == "E0":
                     baseline = summary.copy()
