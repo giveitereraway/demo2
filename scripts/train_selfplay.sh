@@ -59,10 +59,10 @@ echo "env=${env}, scenario=${scenario}, algo=${algo}, policy_loss=${policy_loss}
 CUDA_VISIBLE_DEVICES=0 python train/train_jsbsim.py \
     --env-name "$env" --algorithm-name "$algo" --scenario-name "$scenario" --experiment-name "$exp" \
     --seed "$seed" --n-training-threads 1 --n-rollout-threads 32 --cuda \
-    --log-interval 1 --save-interval 1 \
+    --log-interval 1 --save-interval 10 \
     --use-selfplay --selfplay-algorithm fsp --n-choose-opponents 1 \
-    --use-eval --n-eval-rollout-threads 1 --eval-interval 10 --eval-episodes 10 \
-    --num-mini-batch 5 --buffer-size 3000 --num-env-steps 2e8 \
+    --use-eval --n-eval-rollout-threads 8 --eval-interval 10 --eval-episodes 32 \
+    --num-mini-batch 5 --buffer-size 3000 --num-env-steps 1e8 \
     --policy-loss "$policy_loss" \
     --lr 3e-4 --gamma 0.99 --ppo-epoch 4 --clip-param 0.2 --max-grad-norm 2 --entropy-coef 1e-3 \
     "$@" \

@@ -55,6 +55,7 @@ try:
     from algorithms.ppo.ppo_actor import PPOActor
     from envs.JSBSim.core.catalog import Catalog as c
     from envs.JSBSim.envs import SingleCombatEnv
+    from envs.JSBSim.tasks.singlecombat_task import _get_enemy_radar_track
     from envs.JSBSim.utils.utils import NEU2LLA, get_AO_TA_R
 except Exception as exc:
     if not HELP_REQUESTED:
@@ -312,6 +313,40 @@ def make_actor_args(use_prior: bool) -> SimpleNamespace:
     )
 
 
+def build_actor_args_from_checkpoint(
+    actor_path: Path, obs_space, act_space, default_use_prior: bool
+) -> SimpleNamespace:
+    """读取 checkpoint 同目录的 model_config.json 以支持 mlp / gru / temporal_attention / gru_attention。"""
+    args = make_actor_args(default_use_prior)
+    config_path = actor_path.with_name("model_config.json")
+    if not config_path.is_file():
+        return args
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    if config.get("observation_space") != str(obs_space) or config.get("action_space") != str(act_space):
+        raise ValueError(f"{config_path} 的观测或动作空间与场景不匹配")
+    args.memory_encoder = config["memory_encoder"]
+    args.hidden_size = config["hidden_size"]
+    args.act_hidden_size = config["act_hidden_size"]
+    args.activation_id = config["activation_id"]
+    args.use_feature_normalization = config["use_feature_normalization"]
+    args.use_prior = config["use_prior"]
+    if args.memory_encoder in {"mlp", "gru"}:
+        args.recurrent_hidden_layers, args.recurrent_hidden_size = config["state_shape"]
+    elif args.memory_encoder == "temporal_attention":
+        args.history_length = config["history_length"]
+        args.attention_hidden_size = config["attention_hidden_size"]
+        args.attention_heads = config["attention_heads"]
+    elif args.memory_encoder == "gru_attention":
+        args.recurrent_hidden_size = config["recurrent_hidden_size"]
+        args.recurrent_hidden_layers = config["recurrent_hidden_layers"]
+        args.history_length = config["history_length"]
+        args.attention_hidden_size = config["attention_hidden_size"]
+        args.attention_heads = config["attention_heads"]
+    else:
+        raise ValueError(f"{config_path} 的编码器不受支持: {args.memory_encoder}")
+    return args
+
+
 def resolve_device(device_name: str) -> torch.device:
     if device_name == "auto":
         return torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -352,9 +387,10 @@ class ActorController:
     device: torch.device
 
     def reset(self) -> None:
-        # PPO actor 与分层低层 actor 都是 GRU 策略，每局开始清空隐状态。
-        self.rnn_states = np.zeros((1, 1, 128), dtype=np.float32)
-        self.lowlevel_rnn_states = np.zeros((1, 1, 128), dtype=np.float32)
+        # 根据策略实际 state_shape 清空记忆状态，兼容 GRU、注意力与门控递归注意力。
+        self.rnn_states = np.zeros((1, *self.actor.state_shape), dtype=np.float32)
+        lowlevel_shape = self.lowlevel_policy.state_shape if self.lowlevel_policy is not None else (1, 128)
+        self.lowlevel_rnn_states = np.zeros((1, *lowlevel_shape), dtype=np.float32)
         self.masks = np.ones((1, 1), dtype=np.float32)
 
     @torch.no_grad()
@@ -482,9 +518,14 @@ class ActorController:
         ego = env.agents[agent_id]
         enm = ego.enemies[0]
         ego_pos = np.asarray(ego.get_position(), dtype=np.float32)
-        enm_pos = np.asarray(enm.get_position(), dtype=np.float32)
         ego_vel = np.asarray(ego.get_velocity(), dtype=np.float32)
-        enm_vel = np.asarray(enm.get_velocity(), dtype=np.float32)
+        radar_track = _get_enemy_radar_track(env, agent_id)
+        if radar_track is not None:
+            enm_pos = np.asarray(radar_track[:3], dtype=np.float32)
+            enm_vel = np.array([radar_track[4], radar_track[5], -radar_track[6]], dtype=np.float32)
+        else:
+            enm_pos = np.asarray(enm.get_position(), dtype=np.float32)
+            enm_vel = np.asarray(enm.get_velocity(), dtype=np.float32)
 
         relative = enm_pos - ego_pos
         relative_xy = relative[:2]
@@ -522,7 +563,9 @@ class ActorController:
     def _altitude_step_to_enemy(self, env: SingleCombatEnv, agent_id: str) -> float:
         ego = env.agents[agent_id]
         enm = ego.enemies[0]
-        delta_altitude = float(enm.get_position()[2] - ego.get_position()[2])
+        radar_track = _get_enemy_radar_track(env, agent_id)
+        enm_alt = float(radar_track[3]) if radar_track is not None else float(enm.get_position()[2])
+        delta_altitude = float(enm_alt - ego.get_position()[2])
         if delta_altitude > 250:
             return 0.1
         if delta_altitude < -250:
@@ -778,8 +821,14 @@ def load_controller(
         family = task_family(task_name)
         obs_dim = int(actor_env.observation_space.shape[0])
         actor_action_dim = action_dim(actor_env.action_space)
+        actor_args = build_actor_args_from_checkpoint(
+            actor_path,
+            actor_env.observation_space,
+            actor_env.action_space,
+            default_use_prior=True,
+        )
         actor = PPOActor(
-            make_actor_args(use_prior=True),
+            actor_args,
             actor_env.observation_space,
             actor_env.action_space,
             device=device,

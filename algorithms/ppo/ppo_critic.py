@@ -3,7 +3,12 @@ import torch.nn as nn
 
 from ..utils.mlp import MLPBase, MLPLayer
 from ..utils.gru import GRULayer
-from ..utils.temporal_attention import TemporalAttention, get_memory_encoder, get_policy_state_shape
+from ..utils.temporal_attention import (
+    GatedAttentionGRU,
+    TemporalAttention,
+    get_memory_encoder,
+    get_policy_state_shape,
+)
 from ..utils.utils import check
 
 
@@ -22,8 +27,12 @@ class PPOCritic(nn.Module):
         self.recurrent_hidden_layers = args.recurrent_hidden_layers
         self.tpdv = dict(dtype=torch.float32, device=device)
         # (1) feature extraction module
-        self.base = (TemporalAttention(args, obs_space) if self.memory_encoder == "temporal_attention"
-                     else MLPBase(obs_space, self.hidden_size, self.activation_id, self.use_feature_normalization))
+        if self.memory_encoder == "temporal_attention":
+            self.base = TemporalAttention(args, obs_space)
+        elif self.memory_encoder == "gru_attention":
+            self.base = GatedAttentionGRU(args, obs_space)
+        else:
+            self.base = MLPBase(obs_space, self.hidden_size, self.activation_id, self.use_feature_normalization)
         # (2) rnn module
         input_size = self.base.output_size
         if self.use_recurrent_policy:
@@ -42,7 +51,7 @@ class PPOCritic(nn.Module):
         rnn_states = check(rnn_states).to(**self.tpdv)
         masks = check(masks).to(**self.tpdv)
 
-        if self.memory_encoder == "temporal_attention":
+        if self.memory_encoder in {"temporal_attention", "gru_attention"}:
             critic_features, rnn_states = self.base(obs, rnn_states, masks)
         else:
             critic_features = self.base(obs)

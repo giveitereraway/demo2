@@ -150,8 +150,8 @@ def _get_recurrent_config(parser: argparse.ArgumentParser):
             Time length of chunks used to train a recurrent_policy, default 10.
     """
     group = parser.add_argument_group("Recurrent parameters")
-    group.add_argument("--memory-encoder", choices=["mlp", "gru", "temporal_attention"], default=None,
-                       help="选择记忆编码器；不传时保留旧 GRU 开关的行为")
+    group.add_argument("--memory-encoder", choices=["mlp", "gru", "temporal_attention", "gru_attention"], default=None,
+                       help="选择记忆编码器；gru_attention 为递归滤波与历史因果注意力门控融合")
     group.add_argument("--history-length", type=int, default=16,
                        help="注意力窗口帧数，包含当前帧（默认 16）")
     group.add_argument("--attention-hidden-size", type=int, default=64,
@@ -204,6 +204,8 @@ def _get_ppo_config(parser: argparse.ArgumentParser):
     group = parser.add_argument_group("PPO parameters")
     group.add_argument("--policy-loss", choices=["clip", "spo"], default="clip",
                        help="PPO 策略目标：clip 为原始 PPO，spo 为优势加权二次惩罚（限 SingleControl / SingleCombat）")
+    group.add_argument("--disable-spo-adaptive-dim", dest="spo_adaptive_dim", action="store_false", default=True,
+                       help="关闭多维动作空间的几何平均概率比 SPO 自适应缩放，退回联合概率比惩罚")
     group.add_argument("--ppo-epoch", type=int, default=10,
                        help='number of ppo epochs (default: 10)')
     group.add_argument("--clip-param", type=float, default=0.2,

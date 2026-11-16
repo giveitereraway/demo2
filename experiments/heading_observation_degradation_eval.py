@@ -32,9 +32,11 @@ from envs.JSBSim.envs.singlecontrol_env import HEADING_MEASUREMENT_NOISE_STD, He
 
 MODEL_ENCODERS = {
     "ppo-gru": "gru",
+    "ppo-gru-attention": "gru_attention",
     "ppo-attention": "temporal_attention",
     "ppo-mlp": "mlp",
     "spo-gru": "gru",
+    "spo-gru-attention": "gru_attention",
     "spo-attention": "temporal_attention",
     "spo-mlp": "mlp",
 }
@@ -115,6 +117,8 @@ def parse_args() -> argparse.Namespace:
     heading.add_fixed_sequence_argument(parser)
     parser.add_argument("--measurement-noise", action="store_true",
                         help="改为评估干净观测和三个测量噪声档位，默认评估 E0–E6 误差通道退化")
+    parser.add_argument("--prefer-best", action="store_true",
+                        help="当传入训练目录且存在 actor_best.pt 时优先加载 actor_best.pt")
     parser.add_argument("--quick", action="store_true", help="用 1 个种子评估，单指令模式评估 3 条指令")
     parser.add_argument("--no-plots", action="store_true", help="仅输出表格和配置")
     args = parser.parse_args()
@@ -129,10 +133,11 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def load_actor(path: Path, encoder: str, device: torch.device) -> tuple[Path, heading.PPOActor]:
+def load_actor(path: Path, encoder: str, device: torch.device, *, prefer_best: bool = False) -> tuple[Path, heading.PPOActor]:
     path = path.resolve()
     if path.is_dir():
-        path = path / "actor_latest.pt"
+        best_candidate = path / "actor_best.pt"
+        path = best_candidate if (prefer_best and best_candidate.is_file()) else (path / "actor_latest.pt")
     if not path.is_file():
         raise FileNotFoundError(f"权重文件不存在：{path}")
     if encoder != "gru" and not path.with_name("model_config.json").is_file():
@@ -171,6 +176,7 @@ def run_trial(
     state = torch.zeros((1, *actor.state_shape), device=device)
     masks = torch.ones((1, 1), device=device)
     episode_reward = 0.0
+    gate_values = []
     records = []
     controls = []
     done = False
@@ -182,6 +188,8 @@ def run_trial(
             obs = env.get_obs()[heading.AGENT_ID].astype(np.float32)
         policy_obs = degrader.transform(obs) if degrader is not None else obs
         action, _, state = actor(policy_obs[None, :], state, masks, deterministic=True)
+        if actor.memory_encoder == "gru_attention" and hasattr(actor.base, "last_gate_mean"):
+            gate_values.append(float(actor.base.last_gate_mean))
         action = action.cpu().numpy().astype(np.int64)
         controls.append(env.task.normalize_action(env, heading.AGENT_ID, action[0]))
         next_obs, rewards, dones, _ = env.step(action)
@@ -198,6 +206,8 @@ def run_trial(
     row["success"] = row["success"] and len(records) == horizon_steps
     row["episode_reward"] = episode_reward
     row["actual_dropout_rate"] = degrader.dropped_frames / len(records) if degrader else 0.0
+    if gate_values:
+        row["attention_gate_mean"] = float(np.mean(gate_values))
     return row, stage_rows
 
 
@@ -212,7 +222,12 @@ def plot_mean_rewards(conditions: tuple[str, ...], rows_by_model: dict[str, list
         series = []
         for (model, rows), (marker, linestyle) in zip(rows_by_model.items(), cycle(styles)):
             rewards = [row["episode_reward_mean"] for row in rows]
-            label = model.upper().replace("-", "+", 1).replace("ATTENTION", "注意力")
+            label = (
+                model.upper()
+                .replace("-", "+", 1)
+                .replace("-ATTENTION", "+注意力")
+                .replace("ATTENTION", "注意力")
+            )
             line, = ax.plot(positions, rewards, marker=marker, linestyle=linestyle, label=label)
             series.append((rewards, line.get_color()))
         ax.set_xticks(positions, conditions)
@@ -289,7 +304,8 @@ def main() -> None:
     if device.type == "cpu":
         torch.set_num_threads(1)
     models = {
-        name: load_actor(path, MODEL_ENCODERS[name], device) for name, path in args.models.items()
+        name: load_actor(path, MODEL_ENCODERS[name], device, prefer_best=args.prefer_best)
+        for name, path in args.models.items()
     }
     seeds = heading.SEEDS[:1 if args.quick else args.num_seeds]
     commands = [None] if args.fixed_sequence else heading.build_commands(quick=args.quick)
@@ -362,6 +378,8 @@ def main() -> None:
                 summary = heading.summarize_rows(rows)
                 for metric in ("episode_reward", "actual_dropout_rate"):
                     summary[f"{metric}_mean"] = float(np.mean([row[metric] for row in rows]))
+                if rows and "attention_gate_mean" in rows[0]:
+                    summary["attention_gate_mean"] = float(np.mean([row["attention_gate_mean"] for row in rows]))
                 if condition.name == "E0":
                     baseline = summary.copy()
                 for metric in (

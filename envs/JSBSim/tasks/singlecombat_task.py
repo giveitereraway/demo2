@@ -13,6 +13,17 @@ from ..model.baseline_actor import BaselineActor
 from algorithms.ppo.ppo_actor import PPOActor
 
 
+def _get_enemy_radar_track(env, agent_id):
+    """查询环境中针对该智能体的退化敌机雷达航迹覆盖；干净环境返回 None。"""
+    overrides = getattr(env, "_radar_track_overrides", None)
+    if overrides and agent_id in overrides:
+        return overrides[agent_id]
+    getter = getattr(env, "get_enemy_radar_track", None)
+    if callable(getter):
+        return getter(agent_id)
+    return None
+
+
 
 class SingleCombatTask(BaseTask):
     def __init__(self, config):
@@ -118,8 +129,17 @@ class SingleCombatTask(BaseTask):
         # (0) extract feature: [north(km), east(km), down(km), v_n(mh), v_e(mh), v_d(mh)]
         ego_cur_ned = LLA2NEU(*ego_obs_list[:3], env.center_lon, env.center_lat, env.center_alt)
         enm_cur_ned = LLA2NEU(*enm_obs_list[:3], env.center_lon, env.center_lat, env.center_alt)
+        radar_track = _get_enemy_radar_track(env, agent_id)
+        if radar_track is not None:
+            enm_cur_ned = np.array(radar_track[:3])
+            enm_obs_list = enm_obs_list.copy()
+            enm_obs_list[2] = radar_track[3]
+            enm_obs_list[6:9] = radar_track[4:7]
+            enm_obs_list[9] = radar_track[7]
         ego_feature = np.array([*ego_cur_ned, *(ego_obs_list[6:9])])
         enm_feature = np.array([*enm_cur_ned, *(enm_obs_list[6:9])])
+        enm_v_body_x = enm_obs_list[9]
+        enm_alt_m = enm_obs_list[2]
         # (1) ego info normalization
         norm_obs[0] = ego_obs_list[2] / 5000            # 0. ego altitude   (unit: 5km)
         norm_obs[1] = np.sin(ego_obs_list[3])           # 1. ego_roll_sin
@@ -132,8 +152,8 @@ class SingleCombatTask(BaseTask):
         norm_obs[8] = ego_obs_list[12] / 340            # 8. ego vc   (unit: mh)
         # (2) relative info w.r.t enm state
         ego_AO, ego_TA, R, side_flag = get2d_AO_TA_R(ego_feature, enm_feature, return_side=True)
-        norm_obs[9] = (enm_obs_list[9] - ego_obs_list[9]) / 340
-        norm_obs[10] = (enm_obs_list[2] - ego_obs_list[2]) / 1000
+        norm_obs[9] = (enm_v_body_x - ego_obs_list[9]) / 340
+        norm_obs[10] = (enm_alt_m - ego_obs_list[2]) / 1000
         norm_obs[11] = ego_AO
         norm_obs[12] = ego_TA
         norm_obs[13] = R / 10000
@@ -344,9 +364,14 @@ class TacticalHierarchicalSingleCombatTask(HierarchicalSingleCombatTask):
         ego = env.agents[agent_id]
         enm = ego.enemies[0]
         ego_pos = np.asarray(ego.get_position(), dtype=np.float32)
-        enm_pos = np.asarray(enm.get_position(), dtype=np.float32)
         ego_vel = np.asarray(ego.get_velocity(), dtype=np.float32)
-        enm_vel = np.asarray(enm.get_velocity(), dtype=np.float32)
+        radar_track = _get_enemy_radar_track(env, agent_id)
+        if radar_track is not None:
+            enm_pos = np.asarray(radar_track[:3], dtype=np.float32)
+            enm_vel = np.array([radar_track[4], radar_track[5], -radar_track[6]], dtype=np.float32)
+        else:
+            enm_pos = np.asarray(enm.get_position(), dtype=np.float32)
+            enm_vel = np.asarray(enm.get_velocity(), dtype=np.float32)
 
         relative = enm_pos - ego_pos
         relative_xy = relative[:2]
@@ -388,7 +413,9 @@ class TacticalHierarchicalSingleCombatTask(HierarchicalSingleCombatTask):
     def _altitude_step_to_enemy(self, env, agent_id):
         ego = env.agents[agent_id]
         enm = ego.enemies[0]
-        delta_altitude = enm.get_property_value(c.position_h_sl_m) - ego.get_property_value(c.position_h_sl_m)
+        radar_track = _get_enemy_radar_track(env, agent_id)
+        enm_alt = float(radar_track[3]) if radar_track is not None else enm.get_property_value(c.position_h_sl_m)
+        delta_altitude = enm_alt - ego.get_property_value(c.position_h_sl_m)
         if delta_altitude > 250:
             return 0.1
         if delta_altitude < -250:
@@ -680,6 +707,8 @@ class DodgeMissileAgent:
         enm_cur_ned = LLA2NEU(*enm_obs_list[:3], 120.0, 60.0, 0.0)
         ego_feature = np.array([*ego_cur_ned, *(ego_obs_list[6:9])])
         enm_feature = np.array([*enm_cur_ned, *(enm_obs_list[6:9])])
+        enm_v_body_x = enm_obs_list[9]
+        enm_alt_m = enm_obs_list[2]
         # (1) ego info normalization
         norm_obs[0] = ego_obs_list[2] / 5000            # 0. ego altitude   (unit: 5km)
         norm_obs[1] = np.sin(ego_obs_list[3])           # 1. ego_roll_sin
@@ -692,8 +721,8 @@ class DodgeMissileAgent:
         norm_obs[8] = ego_obs_list[12] / 340            # 8. ego vc   (unit: mh)
         # (2) relative info w.r.t enm state
         ego_AO, ego_TA, R, side_flag = get2d_AO_TA_R(ego_feature, enm_feature, return_side=True)
-        norm_obs[9] = (enm_obs_list[9] - ego_obs_list[9]) / 340
-        norm_obs[10] = (enm_obs_list[2] - ego_obs_list[2]) / 1000
+        norm_obs[9] = (enm_v_body_x - ego_obs_list[9]) / 340
+        norm_obs[10] = (enm_alt_m - ego_obs_list[2]) / 1000
         norm_obs[11] = ego_AO
         norm_obs[12] = ego_TA
         norm_obs[13] = R / 10000

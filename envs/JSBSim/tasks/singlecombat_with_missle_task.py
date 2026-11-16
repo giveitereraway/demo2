@@ -2,7 +2,12 @@ import numpy as np
 from gymnasium import spaces
 from collections import deque
 
-from .singlecombat_task import SingleCombatTask, HierarchicalSingleCombatTask, TacticalHierarchicalSingleCombatTask
+from .singlecombat_task import (
+    SingleCombatTask,
+    HierarchicalSingleCombatTask,
+    TacticalHierarchicalSingleCombatTask,
+    _get_enemy_radar_track,
+)
 from ..reward_functions import AltitudeReward, PostureReward, MissilePostureReward, EventDrivenReward, ShootPenaltyReward
 from ..core.simulatior import MissileSimulator
 from ..utils.utils import LLA2NEU, get_AO_TA_R
@@ -66,6 +71,16 @@ class SingleCombatDodgeMissileTask(SingleCombatTask):
         enm_cur_ned = LLA2NEU(*enm_obs_list[:3], env.center_lon, env.center_lat, env.center_alt)
         ego_feature = np.array([*ego_cur_ned, *ego_obs_list[6:9]])
         enm_feature = np.array([*enm_cur_ned, *enm_obs_list[6:9]])
+        enm_v_body_x = enm_obs_list[9]
+        enm_alt_m = enm_obs_list[2]
+        radar_track = _get_enemy_radar_track(env, agent_id)
+        if radar_track is not None:
+            enm_feature = np.array([
+                radar_track[0], radar_track[1], radar_track[2],
+                radar_track[4], radar_track[5], radar_track[6],
+            ])
+            enm_v_body_x = radar_track[7]
+            enm_alt_m = radar_track[3]
         # (1) ego info normalization
         norm_obs[0] = ego_obs_list[2] / 5000
         norm_obs[1] = np.sin(ego_obs_list[3])
@@ -78,8 +93,8 @@ class SingleCombatDodgeMissileTask(SingleCombatTask):
         norm_obs[8] = ego_obs_list[12] / 340
         # (2) relative enm info
         ego_AO, ego_TA, R, side_flag = get_AO_TA_R(ego_feature, enm_feature, return_side=True)
-        norm_obs[9] = (enm_obs_list[9] - ego_obs_list[9]) / 340
-        norm_obs[10] = (enm_obs_list[2] - ego_obs_list[2]) / 1000
+        norm_obs[9] = (enm_v_body_x - ego_obs_list[9]) / 340
+        norm_obs[10] = (enm_alt_m - ego_obs_list[2]) / 1000
         norm_obs[11] = ego_AO
         norm_obs[12] = ego_TA
         norm_obs[13] = R / 10000

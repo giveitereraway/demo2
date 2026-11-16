@@ -12,10 +12,19 @@ from config import get_config
 from runner.experiment_tracking import create_run_dir, track_swanlab
 from runner.share_jsbsim_runner import ShareJSBSimRunner
 from envs.JSBSim.envs import SingleCombatEnv, SingleControlEnv, MultipleCombatEnv
+from envs.JSBSim.envs.singlecombat_env import (
+    RADAR_DEGRADATION_SPECS,
+    RADAR_TRAIN_PROBABILITIES,
+    SingleCombatRadarDegradationEnv,
+)
 from envs.JSBSim.envs.singlecontrol_env import (
     HEADING_MEASUREMENT_NOISE_PROBABILITIES,
     HEADING_MEASUREMENT_NOISE_STD,
+    HEADING_MIXED_DEGRADATION_PROBABILITIES,
+    HEADING_MIXED_DEGRADATION_SPECS,
     HeadingMeasurementNoiseEnv,
+    HeadingMixedDegradationEnv,
+    HeadingMixedTrackingEvalEnv,
     HeadingTrackingEvalEnv,
 )
 from envs.env_wrappers import SubprocVecEnv, DummyVecEnv, ShareSubprocVecEnv, ShareDummyVecEnv
@@ -28,9 +37,15 @@ def make_train_env(all_args):
     def get_env_fn(rank):
         def init_env():
             if all_args.env_name == "SingleCombat":
-                env = SingleCombatEnv(all_args.scenario_name)
+                env_type = SingleCombatRadarDegradationEnv if all_args.combat_radar_degradation else SingleCombatEnv
+                env = env_type(all_args.scenario_name)
             elif all_args.env_name == "SingleControl":
-                env_type = HeadingMeasurementNoiseEnv if all_args.heading_measurement_noise else SingleControlEnv
+                if all_args.heading_mixed_degradation:
+                    env_type = HeadingMixedDegradationEnv
+                elif all_args.heading_measurement_noise:
+                    env_type = HeadingMeasurementNoiseEnv
+                else:
+                    env_type = SingleControlEnv
                 env = env_type(all_args.scenario_name)
             elif all_args.env_name == "MultipleCombat":
                 env = MultipleCombatEnv(all_args.scenario_name)
@@ -55,15 +70,24 @@ def make_eval_env(all_args):
     def get_env_fn(rank):
         def init_env():
             if all_args.env_name == "SingleCombat":
-                env = SingleCombatEnv(all_args.scenario_name)
-            elif all_args.env_name == "SingleControl":
-                noise_level = HEADING_EVAL_NOISE_LEVEL if all_args.heading_measurement_noise else 0
-                if all_args.heading_first_target:
-                    env = HeadingTrackingEvalEnv(all_args.scenario_name, noise_level=noise_level)
-                elif noise_level:
-                    env = HeadingMeasurementNoiseEnv(all_args.scenario_name, noise_level=noise_level)
+                if all_args.combat_radar_degradation:
+                    env = SingleCombatRadarDegradationEnv(all_args.scenario_name, radar_level=HEADING_EVAL_NOISE_LEVEL)
                 else:
-                    env = SingleControlEnv(all_args.scenario_name)
+                    env = SingleCombatEnv(all_args.scenario_name)
+            elif all_args.env_name == "SingleControl":
+                if all_args.heading_mixed_degradation:
+                    if all_args.heading_first_target:
+                        env = HeadingMixedTrackingEvalEnv(all_args.scenario_name, degradation_level=HEADING_EVAL_NOISE_LEVEL)
+                    else:
+                        env = HeadingMixedDegradationEnv(all_args.scenario_name, degradation_level=HEADING_EVAL_NOISE_LEVEL)
+                else:
+                    noise_level = HEADING_EVAL_NOISE_LEVEL if all_args.heading_measurement_noise else 0
+                    if all_args.heading_first_target:
+                        env = HeadingTrackingEvalEnv(all_args.scenario_name, noise_level=noise_level)
+                    elif noise_level:
+                        env = HeadingMeasurementNoiseEnv(all_args.scenario_name, noise_level=noise_level)
+                    else:
+                        env = SingleControlEnv(all_args.scenario_name)
             elif all_args.env_name == "MultipleCombat":
                 env = MultipleCombatEnv(all_args.scenario_name)
             else:
@@ -92,19 +116,34 @@ def parse_args(args, parser):
                        help="txt or real_time")
     group.add_argument("--heading-measurement-noise", action="store_true",
                        help="Heading 训练采样随机加测量噪声，定期评估固定使用第二档噪声")
+    group.add_argument("--heading-mixed-degradation", action="store_true",
+                       help="Heading 训练采样按概率混合注入高斯噪声、零阶保持丢帧与队列时延，定期评估固定使用 E2 档")
+    group.add_argument("--combat-radar-degradation", action="store_true",
+                       help="SingleCombat 1v1 训练采样混合注入机载火控雷达航迹退化（噪声+丢帧+时延），评估固定使用 E2 档")
     all_args = parser.parse_known_args(args)[0]
+    if all_args.heading_measurement_noise and all_args.heading_mixed_degradation:
+        parser.error("--heading-measurement-noise 与 --heading-mixed-degradation 互斥，请只传其中之一")
     if all_args.heading_measurement_noise and (
         (all_args.env_name, all_args.scenario_name, all_args.algorithm_name) != ("SingleControl", "1/heading", "ppo")
         or all_args.use_selfplay
     ):
         parser.error("--heading-measurement-noise 仅支持 SingleControl / 1/heading 的 PPO 训练")
+    if all_args.heading_mixed_degradation and (
+        (all_args.env_name, all_args.scenario_name, all_args.algorithm_name) != ("SingleControl", "1/heading", "ppo")
+        or all_args.use_selfplay
+    ):
+        parser.error("--heading-mixed-degradation 仅支持 SingleControl / 1/heading 的 PPO 训练")
+    if all_args.combat_radar_degradation and (
+        all_args.env_name != "SingleCombat" or all_args.algorithm_name != "ppo"
+    ):
+        parser.error("--combat-radar-degradation 仅支持 SingleCombat 的 PPO 训练")
     if all_args.policy_loss == "spo" and (all_args.algorithm_name != "ppo"
             or all_args.env_name not in {"SingleControl", "SingleCombat"}):
         parser.error("SPO 仅支持 SingleControl / SingleCombat 的 PPO 训练，暂不支持 MAPPO / MultipleCombat")
     from algorithms.utils.temporal_attention import get_memory_encoder
     try:
         encoder = get_memory_encoder(all_args)
-        if encoder == "temporal_attention" and all_args.env_name not in {"SingleControl", "SingleCombat"}:
+        if encoder in {"temporal_attention", "gru_attention"} and all_args.env_name not in {"SingleControl", "SingleCombat"}:
             raise ValueError("时序注意力仅支持 SingleControl 和 SingleCombat 的 PPO 场景")
     except ValueError as error:
         parser.error(str(error))
@@ -134,6 +173,12 @@ def main(args):
         if all_args.use_eval:
             logging.info("Heading 定期评估使用第二档测量噪声，标准差 %s",
                          all_args.heading_eval_noise_std_m_deg_mps)
+    if all_args.heading_mixed_degradation:
+        logging.info("Heading 混合误差退化（噪声+丢帧+时延）：档位 %s，采样概率 %s",
+                     HEADING_MIXED_DEGRADATION_SPECS, HEADING_MIXED_DEGRADATION_PROBABILITIES)
+    if all_args.combat_radar_degradation:
+        logging.info("SingleCombat 雷达航迹退化：训练档位 %s，采样概率 %s",
+                     RADAR_DEGRADATION_SPECS[:len(RADAR_TRAIN_PROBABILITIES)], RADAR_TRAIN_PROBABILITIES)
 
     # seed
     np.random.seed(all_args.seed) # 设置NumPy随机种子，all_args.seed固定时，每次生成的随机数一样

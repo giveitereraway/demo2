@@ -200,6 +200,12 @@ def build_actor(model_path: Path, device: torch.device) -> PPOActor:
             args.history_length = config["history_length"]
             args.attention_hidden_size = config["attention_hidden_size"]
             args.attention_heads = config["attention_heads"]
+        elif args.memory_encoder == "gru_attention":
+            args.recurrent_hidden_size = config["recurrent_hidden_size"]
+            args.recurrent_hidden_layers = config["recurrent_hidden_layers"]
+            args.history_length = config["history_length"]
+            args.attention_hidden_size = config["attention_hidden_size"]
+            args.attention_heads = config["attention_heads"]
         else:
             raise ValueError(f"{config_path} 的编码器不受支持：{args.memory_encoder}")
     actor = PPOActor(args, obs_space, act_space, device=device)

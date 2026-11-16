@@ -1,13 +1,28 @@
 import math
+from typing import List, Union
 
+import gymnasium as gym
 import numpy as np
 import torch
 import torch.nn as nn
-from typing import Union, List
+
 from .ppo_policy import PPOPolicy
 from ..utils.buffer import ReplayBuffer
-from ..utils.temporal_attention import get_memory_encoder
+from ..utils.temporal_attention import is_recurrent_sequence_encoder
 from ..utils.utils import check, get_gard_norm
+
+
+def get_num_action_heads(act_space) -> int:
+    """统计动作空间中独立随机子决策头的数量 D，用于 SPO-Geo 维度自适应缩放。"""
+    if act_space is None or isinstance(act_space, gym.spaces.Discrete):
+        return 1
+    if isinstance(act_space, gym.spaces.MultiDiscrete):
+        return int(len(act_space.nvec))
+    if isinstance(act_space, (gym.spaces.Box, gym.spaces.MultiBinary)):
+        return int(act_space.shape[0])
+    if isinstance(act_space, gym.spaces.Tuple):
+        return int(sum(get_num_action_heads(sub) for sub in act_space.spaces))
+    return 1
 
 
 class PPOTrainer():
@@ -19,6 +34,7 @@ class PPOTrainer():
         self.ppo_epoch = args.ppo_epoch
         self.clip_param = args.clip_param
         self.policy_loss = getattr(args, "policy_loss", "clip")
+        self.spo_adaptive_dim = getattr(args, "spo_adaptive_dim", True)
         if self.policy_loss not in {"clip", "spo"}:
             raise ValueError("--policy-loss 只支持 clip 或 spo")
         if self.policy_loss == "spo" and (not math.isfinite(self.clip_param) or self.clip_param <= 0):
@@ -30,8 +46,9 @@ class PPOTrainer():
         self.use_max_grad_norm = args.use_max_grad_norm
         self.max_grad_norm = args.max_grad_norm
         # rnn configs
-        self.use_recurrent_policy = get_memory_encoder(args) == "gru"
+        self.use_recurrent_policy = is_recurrent_sequence_encoder(args)
         self.data_chunk_length = args.data_chunk_length
+        self._last_geo_ratio = None
 
     def ppo_update(self, policy: PPOPolicy, sample):
 
@@ -57,11 +74,22 @@ class PPOTrainer():
                 or action_log_probs.shape != old_action_log_probs_batch.shape
                 or action_log_probs.shape != advantages_batch.shape):
             raise ValueError("新旧动作 log probability 和优势必须同为 [batch, 1]")
-        ratio = torch.exp(action_log_probs - old_action_log_probs_batch) # 新旧策略比
-        surr1 = ratio * advantages_batch # 概率比乘以优势函数
+        log_ratio = action_log_probs - old_action_log_probs_batch
+        ratio = torch.exp(log_ratio)  # 新旧策略联合概率比
+        surr1 = ratio * advantages_batch  # 概率比乘以优势函数
+        act_heads = get_num_action_heads(getattr(policy, "act_space", None)) if self.spo_adaptive_dim else 1
+        geo_ratio = torch.exp(log_ratio / act_heads) if act_heads > 1 else ratio
+        self._last_geo_ratio = geo_ratio.detach()
         if self.policy_loss == "spo":
-            # Xie 等，Simple Policy Optimization，ICML 2025，公式 (16)。
-            surrogate = surr1 - advantages_batch.abs() / (2 * self.clip_param) * (ratio - 1).square()
+            # 单维动作 (D=1) 时严格退化为 Xie 等 (ICML 2025) 公式 (16)；
+            # 多维动作 (D>1) 时使用几何平均概率比 SPO-Geo，消除联合乘积畸变并保持一阶梯度无偏。
+            if act_heads > 1:
+                surrogate = act_heads * (
+                    geo_ratio * advantages_batch
+                    - advantages_batch.abs() / (2 * self.clip_param) * (geo_ratio - 1).square()
+                )
+            else:
+                surrogate = surr1 - advantages_batch.abs() / (2 * self.clip_param) * (ratio - 1).square()
         else:
             surr2 = torch.clamp(ratio, 1.0 - self.clip_param, 1.0 + self.clip_param) * advantages_batch
             surrogate = torch.min(surr1, surr2)
@@ -105,6 +133,17 @@ class PPOTrainer():
         train_info['ratio_deviation'] = 0
         train_info['approx_kl'] = 0
         train_info['ratio_out_of_bounds'] = 0
+        train_info['geo_ratio_deviation'] = 0
+        train_info['geo_approx_kl'] = 0
+        train_info['geo_ratio_out_of_bounds'] = 0
+        has_gate = (
+            hasattr(policy, "actor")
+            and getattr(policy.actor, "memory_encoder", None) == "gru_attention"
+            and hasattr(policy.actor.base, "last_gate_mean")
+        )
+        if has_gate:
+            train_info['actor_attention_gate'] = 0
+            train_info['critic_attention_gate'] = 0
 
         for _ in range(self.ppo_epoch):
             if self.use_recurrent_policy:
@@ -129,6 +168,15 @@ class PPOTrainer():
                     train_info['ratio_out_of_bounds'] += (
                         (ratio < 1 - self.clip_param) | (ratio > 1 + self.clip_param)
                     ).float().mean().item()
+                    geo = self._last_geo_ratio if self._last_geo_ratio is not None else ratio
+                    train_info['geo_ratio_deviation'] += (geo - 1).abs().mean().item()
+                    train_info['geo_approx_kl'] += ((geo - 1) - geo.log()).mean().item()
+                    train_info['geo_ratio_out_of_bounds'] += (
+                        (geo < 1 - self.clip_param) | (geo > 1 + self.clip_param)
+                    ).float().mean().item()
+                if has_gate:
+                    train_info['actor_attention_gate'] += float(policy.actor.base.last_gate_mean)
+                    train_info['critic_attention_gate'] += float(policy.critic.base.last_gate_mean)
 
         num_updates = self.ppo_epoch * self.num_mini_batch
 

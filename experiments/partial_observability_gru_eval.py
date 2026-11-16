@@ -14,6 +14,7 @@ Actor B 始终接收干净观测并正常保持 GRU 隐状态。
 
 from __future__ import annotations
 
+import argparse
 import csv
 import importlib.util
 import json
@@ -555,8 +556,30 @@ def run_episode(
     sensor_rng = np.random.default_rng(
         SENSOR_SEED + condition.sensor_seed_group * 100000 + episode
     )
-    degrader = ObservationDegrader(condition.degradation, sensor_rng)
-    degrader.reset(obs[actor_a_slot])
+    use_radar_track_degrader = bool(getattr(actor_a, "is_tactical", False))
+    radar_degrader = None
+    if use_radar_track_degrader:
+        from envs.JSBSim.envs.singlecombat_env import (
+            RadarDegradationSpec,
+            RadarTrackDegrader,
+            extract_true_enemy_track,
+        )
+
+        deg = condition.degradation
+        radar_spec = RadarDegradationSpec(
+            dropout_probability=deg.dropout_probability,
+            delay_steps=deg.delay_steps,
+            range_noise_std_m=deg.range_noise_std_m,
+            azimuth_noise_std_deg=deg.angle_noise_std_deg,
+            altitude_noise_std_m=deg.relative_altitude_noise_std_m,
+            velocity_noise_std_mps=deg.relative_speed_noise_std_mps,
+        )
+        radar_degrader = RadarTrackDegrader(radar_spec, sensor_rng)
+        radar_degrader.reset(extract_true_enemy_track(env, actor_a_agent_id))
+        degrader = None
+    else:
+        degrader = ObservationDegrader(condition.degradation, sensor_rng)
+        degrader.reset(obs[actor_a_slot])
 
     actor_rewards = {"actor_a": 0.0, "actor_b": 0.0}
     relative_history: Dict[str, List[float]] = {}
@@ -577,17 +600,33 @@ def run_episode(
         actions = []
         for slot, controller in enumerate(slot_controllers):
             controller_obs = obs[slot]
+            agent_id = actor_to_agent_id[controller.name]
             if controller.name == "actor_a":
                 if maybe_reset_actor_hidden(
                     controller, step_index, condition.gru_reset_interval
                 ):
                     gru_reset_count += 1
+                if radar_degrader is not None:
+                    from envs.JSBSim.envs.singlecombat_env import extract_true_enemy_track
+
+                    degraded_track = radar_degrader.transform(
+                        env.agents[agent_id].get_position(),
+                        extract_true_enemy_track(env, agent_id),
+                    )
+                    env._radar_track_overrides = {agent_id: degraded_track}
+                    try:
+                        controller_obs = env.task.get_obs(env, agent_id).astype(np.float32)
+                        action_out = controller.act(controller_obs, env=env, agent_id=agent_id)
+                    finally:
+                        env._radar_track_overrides = None
+                    actions.append(action_out)
+                    continue
                 controller_obs = degrader.transform(controller_obs)
             actions.append(
                 controller.act(
                     controller_obs,
                     env=env,
-                    agent_id=actor_to_agent_id[controller.name],
+                    agent_id=agent_id,
                 )
             )
 
@@ -661,7 +700,9 @@ def run_episode(
         "actor_a_mean_ao_deg": metric_mean(relative_history, "actor_a_ao_deg"),
         "actor_a_mean_ta_deg": metric_mean(relative_history, "actor_a_ta_deg"),
         "mean_distance_m": metric_mean(relative_history, "distance_m"),
-        "actual_dropout_rate": degrader.actual_dropout_rate,
+        "actual_dropout_rate": (
+            radar_degrader.actual_dropout_rate if radar_degrader is not None else degrader.actual_dropout_rate
+        ),
         "gru_reset_count": gru_reset_count,
         "acmi_path": str(acmi_path) if acmi_path is not None else "",
         **initial_summary,
@@ -997,41 +1038,73 @@ def config_snapshot(actor_a_path: Path, actor_b_path: Path) -> Dict[str, object]
     }
 
 
-def main() -> None:
-    if NUM_EPISODES_PER_CONDITION <= 0:
+def parse_cli_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    """支持命令行覆盖路径、场景、局数和设备；无参数时沿用顶部配置。"""
+    parser = argparse.ArgumentParser(description="1v1 部分可观测鲁棒性与记忆有效性评估")
+    parser.add_argument("--actor-a-path", type=Path, default=None, help="被测 Actor A 权重或目录")
+    parser.add_argument("--actor-b-path", type=Path, default=None, help="对手 Actor B 权重或目录")
+    parser.add_argument("--actor-a-scenario", type=str, default=None, help="Actor A 训练场景名")
+    parser.add_argument("--actor-b-scenario", type=str, default=None, help="Actor B 训练场景名")
+    parser.add_argument("--eval-scenario", type=str, default=None, help="对战评估环境场景名")
+    parser.add_argument("--episodes", type=int, default=None, help="每个实验条件运行的对局数")
+    parser.add_argument("--device", type=str, default=None, help="推理设备，如 auto / cpu / cuda:0")
+    parser.add_argument("--output-dir", type=Path, default=None, help="自定义结果输出目录")
+    return parser.parse_args(argv)
+
+
+def main(argv: Optional[Sequence[str]] = None) -> None:
+    cli = parse_cli_args(argv)
+    num_episodes = cli.episodes if cli.episodes is not None else NUM_EPISODES_PER_CONDITION
+    actor_a_scenario = cli.actor_a_scenario or ACTOR_A_SCENARIO_NAME
+    actor_b_scenario = cli.actor_b_scenario or ACTOR_B_SCENARIO_NAME
+    eval_scenario = cli.eval_scenario or EVAL_SCENARIO_NAME
+    device_name = cli.device or DEVICE
+
+    if num_episodes <= 0:
         raise ValueError("NUM_EPISODES_PER_CONDITION 必须为正整数。")
     validate_experiment_design()
 
     validate_scenario_configs(
-        (ACTOR_A_SCENARIO_NAME, ACTOR_B_SCENARIO_NAME, EVAL_SCENARIO_NAME)
+        (actor_a_scenario, actor_b_scenario, eval_scenario)
     )
-    actor_a_path = resolve_actor_path(ACTOR_A_PATH)
-    actor_b_path = resolve_actor_path(ACTOR_B_PATH)
+    actor_a_path = resolve_actor_path(cli.actor_a_path or ACTOR_A_PATH)
+    actor_b_path = resolve_actor_path(cli.actor_b_path or ACTOR_B_PATH)
 
     base = load_base_eval_module()
     configure_base_module(base)
     np.random.seed(ENV_SEED)
     base.torch.manual_seed(ENV_SEED)
-    device = base.resolve_device(DEVICE)
+    device = base.resolve_device(device_name)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = OUTPUT_ROOT / f"run_{timestamp}"
+    output_dir = (cli.output_dir.resolve() if cli.output_dir is not None else OUTPUT_ROOT / f"run_{timestamp}")
     output_dir.mkdir(parents=True, exist_ok=True)
-    save_json(config_snapshot(actor_a_path, actor_b_path), output_dir / "config.json")
+    snapshot = config_snapshot(actor_a_path, actor_b_path)
+    snapshot.update({
+        "actor_a_scenario_name": actor_a_scenario,
+        "actor_b_scenario_name": actor_b_scenario,
+        "eval_scenario_name": eval_scenario,
+        "num_episodes_per_condition": num_episodes,
+        "device": str(device),
+    })
+    save_json(snapshot, output_dir / "config.json")
 
-    # 本实验只针对直接控制1v1策略，不需要加载分层低层控制器。
+    needs_lowlevel = any("Hierarchy" in name for name in (actor_a_scenario, actor_b_scenario))
+    lowlevel_policy = base.load_lowlevel_policy(device) if needs_lowlevel else None
     actor_a = base.load_controller(
-        "actor_a", actor_a_path, ACTOR_A_SCENARIO_NAME, None, device
+        "actor_a", actor_a_path, actor_a_scenario, lowlevel_policy, device
     )
     actor_b = base.load_controller(
-        "actor_b", actor_b_path, ACTOR_B_SCENARIO_NAME, None, device
+        "actor_b", actor_b_path, actor_b_scenario, lowlevel_policy, device
     )
-    if actor_a.is_hierarchical or actor_b.is_hierarchical:
-        raise ValueError("本脚本只支持直接控制 actor，不支持分层 actor。")
+    if (actor_a.is_hierarchical or actor_b.is_hierarchical) and lowlevel_policy is None:
+        lowlevel_policy = base.load_lowlevel_policy(device)
+        actor_a.lowlevel_policy = lowlevel_policy
+        actor_b.lowlevel_policy = lowlevel_policy
 
     print(f"输出目录: {output_dir}")
     print(f"设备: {device}")
-    print(f"每组回合数: {NUM_EPISODES_PER_CONDITION}")
+    print(f"每组回合数: {num_episodes}")
 
     all_rows: List[Dict[str, object]] = []
     summaries: List[Dict[str, object]] = []
@@ -1039,7 +1112,7 @@ def main() -> None:
         print(f"\n===== {condition.condition_id}: {condition.label} =====")
         condition_dir = output_dir / condition.condition_id
         condition_dir.mkdir(parents=True, exist_ok=True)
-        env = base.SingleCombatEnv(EVAL_SCENARIO_NAME)
+        env = base.SingleCombatEnv(eval_scenario)
         env.seed(ENV_SEED)
         try:
             base.validate_setup(env, [actor_a, actor_b])
@@ -1053,7 +1126,7 @@ def main() -> None:
                     actor_b,
                     condition_dir,
                 )
-                for episode in range(NUM_EPISODES_PER_CONDITION)
+                for episode in range(num_episodes)
             ]
         finally:
             env.close()
