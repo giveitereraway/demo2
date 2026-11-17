@@ -49,6 +49,7 @@ class PPOTrainer():
         self.use_recurrent_policy = is_recurrent_sequence_encoder(args)
         self.data_chunk_length = args.data_chunk_length
         self._last_geo_ratio = None
+        self._last_geo_clip_param = None
 
     def ppo_update(self, policy: PPOPolicy, sample):
 
@@ -79,14 +80,19 @@ class PPOTrainer():
         surr1 = ratio * advantages_batch  # 概率比乘以优势函数
         act_heads = get_num_action_heads(getattr(policy, "act_space", None)) if self.spo_adaptive_dim else 1
         geo_ratio = torch.exp(log_ratio / act_heads) if act_heads > 1 else ratio
+        geo_clip_param = self.clip_param / act_heads
         self._last_geo_ratio = geo_ratio.detach()
+        self._last_geo_clip_param = geo_clip_param
         if self.policy_loss == "spo":
             # 单维动作 (D=1) 时严格退化为 Xie 等 (ICML 2025) 公式 (16)；
-            # 多维动作 (D>1) 时使用几何平均概率比 SPO-Geo，消除联合乘积畸变并保持一阶梯度无偏。
+            # 多维动作 (D>1) 时采用欧拉极限信赖域半径 eps_geo = eps / D 的几何平均概率比 SPO-Geo：
+            # 1) r_geo=1 处保持一阶策略梯度严格无偏；
+            # 2) 二阶惩罚曲率保持 |A|/(2*eps)*(log r)^2 与维数 D 无关，联合驻点 r* = (1+-eps/D)^D -> exp(+-eps)；
+            # 3) 将原版 SPO 的三阶指数乘积畸变项压低 1/D，消除高维联合比率非对称爆炸。
             if act_heads > 1:
                 surrogate = act_heads * (
                     geo_ratio * advantages_batch
-                    - advantages_batch.abs() / (2 * self.clip_param) * (geo_ratio - 1).square()
+                    - advantages_batch.abs() / (2 * geo_clip_param) * (geo_ratio - 1).square()
                 )
             else:
                 surrogate = surr1 - advantages_batch.abs() / (2 * self.clip_param) * (ratio - 1).square()
@@ -169,10 +175,11 @@ class PPOTrainer():
                         (ratio < 1 - self.clip_param) | (ratio > 1 + self.clip_param)
                     ).float().mean().item()
                     geo = self._last_geo_ratio if self._last_geo_ratio is not None else ratio
+                    geo_clip = self._last_geo_clip_param if self._last_geo_clip_param is not None else self.clip_param
                     train_info['geo_ratio_deviation'] += (geo - 1).abs().mean().item()
                     train_info['geo_approx_kl'] += ((geo - 1) - geo.log()).mean().item()
                     train_info['geo_ratio_out_of_bounds'] += (
-                        (geo < 1 - self.clip_param) | (geo > 1 + self.clip_param)
+                        (geo < 1 - geo_clip) | (geo > 1 + geo_clip)
                     ).float().mean().item()
                 if has_gate:
                     train_info['actor_attention_gate'] += float(policy.actor.base.last_gate_mean)

@@ -154,13 +154,15 @@ def test_gated_attention_gru_step_vs_chunk_equivalence_and_update(act_space, pol
 
 
 def test_spo_geo_unbiased_gradient_and_multidiscrete_trust_region():
-    """验证 SPO-Geo 在 D=4 多维离散动作下消除联合乘积锁死，且在 r_geo=1 处保持一阶无偏梯度。"""
+    """验证欧拉极限 SPO-Geo 的一阶无偏性、二阶联合 KL 曲率维度不变性、对称欧拉驻点与抗乘积爆炸性质。"""
+    act_space_1d = gym.spaces.Discrete(12)
+    act_space_2d = gym.spaces.Tuple([gym.spaces.Discrete(12), gym.spaces.Discrete(2)])
     act_space_4d = gym.spaces.MultiDiscrete([41, 41, 41, 30])
     assert get_num_action_heads(act_space_4d) == 4
-    assert get_num_action_heads(gym.spaces.Discrete(12)) == 1
-    assert get_num_action_heads(gym.spaces.Tuple([gym.spaces.Discrete(12), gym.spaces.Discrete(2)])) == 2
+    assert get_num_action_heads(act_space_1d) == 1
+    assert get_num_action_heads(act_space_2d) == 2
 
-    def eval_spo_grad(joint_ratio: float, advantage: float, adaptive: bool):
+    def eval_spo_loss_grad_curv(joint_ratio: float, advantage: float, *, act_space=act_space_4d, adaptive: bool = True):
         cli = ["--policy-loss", "spo", "--clip-param", "0.2"]
         if not adaptive:
             cli.append("--disable-spo-adaptive-dim")
@@ -170,7 +172,7 @@ def test_spo_geo_unbiased_gradient_and_multidiscrete_trust_region():
         logp = torch.nn.Parameter(torch.tensor([[np.log(joint_ratio)]], dtype=torch.float32))
         val = torch.nn.Parameter(torch.zeros_like(logp))
         policy = SimpleNamespace(
-            act_space=act_space_4d,
+            act_space=act_space,
             actor=torch.nn.ParameterList([logp]),
             critic=torch.nn.ParameterList([val]),
             optimizer=torch.optim.SGD([logp, val], lr=0.0),
@@ -178,19 +180,48 @@ def test_spo_geo_unbiased_gradient_and_multidiscrete_trust_region():
         )
         zeros = torch.zeros_like(logp)
         sample = (None, None, None, zeros, torch.tensor([[advantage]], dtype=torch.float32), zeros, zeros, None, None)
-        loss, *_ = PPOTrainer(args).ppo_update(policy, sample)
-        return loss.item(), logp.grad.item()
+        trainer = PPOTrainer(args)
+        loss, *_ = trainer.ppo_update(policy, sample)
+        return loss.item(), logp.grad.item(), trainer._last_geo_clip_param
 
-    # 1) 在新旧策略相等 (r=1) 处，SPO-Geo 与标准策略梯度完全一致：d(-r*A)/d(log pi) = -A = -2.0。
-    _, grad_at_one = eval_spo_grad(1.0, 2.0, adaptive=True)
-    assert grad_at_one == pytest.approx(-2.0, abs=1e-6)
+    # 1) D=1 (Discrete) 时，SPO-Geo 与原版 SPO 逐位严格等价。
+    loss_1d_geo, grad_1d_geo, clip_1d = eval_spo_loss_grad_curv(1.35, 2.0, act_space=act_space_1d, adaptive=True)
+    loss_1d_raw, grad_1d_raw, _ = eval_spo_loss_grad_curv(1.35, 2.0, act_space=act_space_1d, adaptive=False)
+    assert clip_1d == pytest.approx(0.2)
+    assert loss_1d_geo == pytest.approx(loss_1d_raw, abs=1e-6)
+    assert grad_1d_geo == pytest.approx(grad_1d_raw, abs=1e-6)
 
-    # 2) 当 4 个子动作各自仅更新 +20% (r_geo = 1.2, 联合 ratio = 1.2^4 = 2.0736) 时：
-    #    SPO-Geo 正好到达信任域极值点，梯度为 0；而未归一化的原始 SPO 已产生强烈反向拉回梯度 (> +20)。
-    _, grad_geo_peak = eval_spo_grad(1.2 ** 4, 2.0, adaptive=True)
-    _, grad_raw_choked = eval_spo_grad(1.2 ** 4, 2.0, adaptive=False)
-    assert grad_geo_peak == pytest.approx(0.0, abs=1e-5)
-    assert grad_raw_choked > 15.0
+    # 2) 在新旧策略相等 (r=1) 处，任意维数 D 下 SPO-Geo 与标准策略梯度严格一致：d(-r*A)/d(log pi) = -A。
+    for sp in (act_space_1d, act_space_2d, act_space_4d):
+        _, grad_pos, _ = eval_spo_loss_grad_curv(1.0, 2.0, act_space=sp, adaptive=True)
+        _, grad_neg, _ = eval_spo_loss_grad_curv(1.0, -2.0, act_space=sp, adaptive=True)
+        assert grad_pos == pytest.approx(-2.0, abs=1e-6)
+        assert grad_neg == pytest.approx(2.0, abs=1e-6)
+
+    # 3) 欧拉极限驻点验证：eps=0.2, D=4 时 eps_geo = 0.05，正/负优势极值点严格位于 (1 +- 0.05)^4。
+    _, grad_pos_peak, clip_4d = eval_spo_loss_grad_curv(1.05 ** 4, 2.0, act_space=act_space_4d, adaptive=True)
+    _, grad_neg_peak, _ = eval_spo_loss_grad_curv(0.95 ** 4, -2.0, act_space=act_space_4d, adaptive=True)
+    assert clip_4d == pytest.approx(0.05)
+    assert grad_pos_peak == pytest.approx(0.0, abs=1e-5)
+    assert grad_neg_peak == pytest.approx(0.0, abs=1e-5)
+
+    # 4) 二阶惩罚曲率维度不变性：纯二次惩罚项在 log r = 0 处的二阶导恒为 |A| / eps = 10.0 (与 D 无关)。
+    eps_fd = 1e-3
+    for sp, d_heads in ((act_space_1d, 1), (act_space_2d, 2), (act_space_4d, 4)):
+        _, g_plus, _ = eval_spo_loss_grad_curv(float(np.exp(eps_fd)), 2.0, act_space=sp, adaptive=True)
+        _, g_minus, _ = eval_spo_loss_grad_curv(float(np.exp(-eps_fd)), 2.0, act_space=sp, adaptive=True)
+        total_hessian = (g_plus - g_minus) / (2 * eps_fd)
+        # 总损失对 log r 的二阶导为 -A / D + |A| / eps，故提取纯惩罚曲率项应恒等于 |A| / eps = 10.0。
+        penalty_curvature = total_hessian + 2.0 / d_heads
+        assert penalty_curvature == pytest.approx(2.0 / 0.2, rel=1e-3)
+
+    # 5) 抗指数乘积爆炸与合理越界约束：在 r = 1.2^4 = 2.0736 处，
+    #    欧拉极限 SPO-Geo 施加温和正向拉回梯度 (+7.20)，既防止旧版过松零梯度导致的 KL 失控，
+    #    又显著低于未归一化原始 SPO 的指数爆炸梯度 (+18.12)。
+    _, grad_euler_pullback, _ = eval_spo_loss_grad_curv(1.2 ** 4, 2.0, act_space=act_space_4d, adaptive=True)
+    _, grad_raw_explosion, _ = eval_spo_loss_grad_curv(1.2 ** 4, 2.0, act_space=act_space_4d, adaptive=False)
+    assert grad_euler_pullback == pytest.approx(7.2, abs=1e-4)
+    assert grad_raw_explosion > 2.5 * grad_euler_pullback
 
 
 def test_heading_mixed_degradation_env_isolates_error_channels_and_preserves_physics():
