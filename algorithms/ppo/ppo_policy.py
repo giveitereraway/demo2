@@ -42,6 +42,9 @@ class PPOPolicy:
                                      history_length=args.history_length,
                                      attention_hidden_size=args.attention_hidden_size,
                                      attention_heads=args.attention_heads)
+        elif self.actor.memory_encoder == "igru":
+            self.model_config.update(recurrent_hidden_size=args.recurrent_hidden_size,
+                                     recurrent_hidden_layers=args.recurrent_hidden_layers)
 
         self.optimizer = torch.optim.Adam([
             {'params': self.actor.parameters()},
@@ -55,8 +58,8 @@ class PPOPolicy:
     def validate_model_config(self, directory):
         path = Path(directory) / "model_config.json"
         if not path.exists():
-            if self.actor.memory_encoder in {"temporal_attention", "gru_attention"}:
-                raise ValueError("注意力模型缺少 model_config.json，无法核对网络结构")
+            if self.actor.memory_encoder in {"temporal_attention", "gru_attention", "igru"}:
+                raise ValueError("扩展时序模型缺少 model_config.json，无法核对网络结构")
             return
         with path.open(encoding="utf-8") as stream:
             saved = json.load(stream)

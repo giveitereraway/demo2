@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 
 from ..utils.mlp import MLPBase, MLPLayer
-from ..utils.gru import GRULayer
+from ..utils.gru import GRULayer, InnovationGatedResidualGRU
 from ..utils.temporal_attention import (
     GatedAttentionGRU,
     TemporalAttention,
@@ -31,6 +31,8 @@ class PPOCritic(nn.Module):
             self.base = TemporalAttention(args, obs_space)
         elif self.memory_encoder == "gru_attention":
             self.base = GatedAttentionGRU(args, obs_space)
+        elif self.memory_encoder == "igru":
+            self.base = InnovationGatedResidualGRU(args, obs_space)
         else:
             self.base = MLPBase(obs_space, self.hidden_size, self.activation_id, self.use_feature_normalization)
         # (2) rnn module
@@ -51,7 +53,7 @@ class PPOCritic(nn.Module):
         rnn_states = check(rnn_states).to(**self.tpdv)
         masks = check(masks).to(**self.tpdv)
 
-        if self.memory_encoder in {"temporal_attention", "gru_attention"}:
+        if self.memory_encoder in {"temporal_attention", "gru_attention", "igru"}:
             critic_features, rnn_states = self.base(obs, rnn_states, masks)
         else:
             critic_features = self.base(obs)

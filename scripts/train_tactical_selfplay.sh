@@ -27,6 +27,12 @@ case "$variant" in
         set -- --memory-encoder gru --hidden-size "128 128" \
             --recurrent-hidden-size 128 --recurrent-hidden-layers 1 --data-chunk-length 10
         ;;
+    ppo-igru)
+        policy_loss="clip"
+        encoder="igru"
+        set -- --memory-encoder igru --hidden-size "128 128" \
+            --recurrent-hidden-size 128 --recurrent-hidden-layers 1 --data-chunk-length 10
+        ;;
     ppo-gru-attention)
         policy_loss="clip"
         encoder="gru_attention"
@@ -41,6 +47,12 @@ case "$variant" in
         set -- --memory-encoder gru --hidden-size "128 128" \
             --recurrent-hidden-size 128 --recurrent-hidden-layers 1 --data-chunk-length 10
         ;;
+    spo-igru)
+        policy_loss="spo"
+        encoder="igru"
+        set -- --memory-encoder igru --hidden-size "128 128" \
+            --recurrent-hidden-size 128 --recurrent-hidden-layers 1 --data-chunk-length 10
+        ;;
     spo-gru-attention)
         policy_loss="spo"
         encoder="gru_attention"
@@ -50,7 +62,7 @@ case "$variant" in
             --data-chunk-length 10
         ;;
     *)
-        echo "用法：$0 {ppo-gru|ppo-gru-attention|spo-gru|spo-gru-attention} [radar|clean] [seed]" >&2
+        echo "用法：$0 {ppo-gru|ppo-igru|ppo-gru-attention|spo-gru|spo-igru|spo-gru-attention} [radar|clean] [seed]" >&2
         exit 2
         ;;
 esac

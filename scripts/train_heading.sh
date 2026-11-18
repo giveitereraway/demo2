@@ -24,7 +24,7 @@ case "$encoder" in
     mlp)
         set -- --hidden-size "128 128"
         ;;
-    gru)
+    gru|igru)
         set -- --hidden-size "128 128" \
             --recurrent-hidden-size 128 --recurrent-hidden-layers 1 \
             --data-chunk-length 10
@@ -39,7 +39,7 @@ case "$encoder" in
         set -- --history-length "$history_length" --attention-hidden-size 128 --attention-heads 4
         ;;
     *)
-        echo "编码器须为 mlp、gru、gru_attention 或 temporal_attention" >&2
+        echo "编码器须为 mlp、gru、igru、gru_attention 或 temporal_attention" >&2
         exit 1
         ;;
 esac

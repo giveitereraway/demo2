@@ -150,8 +150,8 @@ def _get_recurrent_config(parser: argparse.ArgumentParser):
             Time length of chunks used to train a recurrent_policy, default 10.
     """
     group = parser.add_argument_group("Recurrent parameters")
-    group.add_argument("--memory-encoder", choices=["mlp", "gru", "temporal_attention", "gru_attention"], default=None,
-                       help="选择记忆编码器；gru_attention 为递归滤波与历史因果注意力门控融合")
+    group.add_argument("--memory-encoder", choices=["mlp", "gru", "igru", "temporal_attention", "gru_attention"], default=None,
+                       help="选择记忆编码器；igru 为新息门控残差 GRU，gru_attention 为递归滤波与历史因果注意力门控融合")
     group.add_argument("--history-length", type=int, default=16,
                        help="注意力窗口帧数，包含当前帧（默认 16）")
     group.add_argument("--attention-hidden-size", type=int, default=64,

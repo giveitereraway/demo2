@@ -143,8 +143,8 @@ def parse_args(args, parser):
     from algorithms.utils.temporal_attention import get_memory_encoder
     try:
         encoder = get_memory_encoder(all_args)
-        if encoder in {"temporal_attention", "gru_attention"} and all_args.env_name not in {"SingleControl", "SingleCombat"}:
-            raise ValueError("时序注意力仅支持 SingleControl 和 SingleCombat 的 PPO 场景")
+        if encoder in {"temporal_attention", "gru_attention", "igru"} and all_args.env_name not in {"SingleControl", "SingleCombat"}:
+            raise ValueError("扩展时序编码器仅支持 SingleControl 和 SingleCombat 的 PPO 场景")
     except ValueError as error:
         parser.error(str(error))
     if all_args.heading_first_target:

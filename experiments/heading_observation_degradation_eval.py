@@ -32,10 +32,12 @@ from envs.JSBSim.envs.singlecontrol_env import HEADING_MEASUREMENT_NOISE_STD, He
 
 MODEL_ENCODERS = {
     "ppo-gru": "gru",
+    "ppo-igru": "igru",
     "ppo-gru-attention": "gru_attention",
     "ppo-attention": "temporal_attention",
     "ppo-mlp": "mlp",
     "spo-gru": "gru",
+    "spo-igru": "igru",
     "spo-gru-attention": "gru_attention",
     "spo-attention": "temporal_attention",
     "spo-mlp": "mlp",
@@ -188,7 +190,7 @@ def run_trial(
             obs = env.get_obs()[heading.AGENT_ID].astype(np.float32)
         policy_obs = degrader.transform(obs) if degrader is not None else obs
         action, _, state = actor(policy_obs[None, :], state, masks, deterministic=True)
-        if actor.memory_encoder == "gru_attention" and hasattr(actor.base, "last_gate_mean"):
+        if actor.memory_encoder in {"gru_attention", "igru"} and hasattr(actor.base, "last_gate_mean"):
             gate_values.append(float(actor.base.last_gate_mean))
         action = action.cpu().numpy().astype(np.int64)
         controls.append(env.task.normalize_action(env, heading.AGENT_ID, action[0]))
