@@ -72,6 +72,7 @@ case "$observation" in
     clean)
         ;;
     radar)
+        # 每局双方使用相同的退化档位，独立采样观测噪声和丢帧。
         exp="${exp}_radar"
         set -- "$@" --combat-radar-degradation
         ;;

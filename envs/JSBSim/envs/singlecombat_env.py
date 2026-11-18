@@ -205,7 +205,10 @@ class SingleCombatEnv(BaseEnv):
 class SingleCombatRadarDegradationEnv(SingleCombatEnv):
     """在 1v1 空战训练与验证中对敌机雷达航迹施加加噪、脱锁丢帧保持与滤波时延，同时作用于观测与战术导引解算。"""
 
-    def __init__(self, config_name: str, *, radar_level=None, agent_radar_levels=None, sensor_seed=0):
+    def __init__(
+        self, config_name: str, *, radar_level=None, agent_radar_levels=None, sensor_seed=0,
+        shared_episode_level=False,
+    ):
         self.radar_level = radar_level
         self.agent_radar_levels = dict(agent_radar_levels) if agent_radar_levels is not None else None
         self.sensor_seed = sensor_seed
@@ -214,6 +217,11 @@ class SingleCombatRadarDegradationEnv(SingleCombatEnv):
         self._latest_radar_tracks = {}
         self._radar_track_steps = {}
         super().__init__(config_name)
+        self._share_episode_level = (
+            shared_episode_level
+            and self.config.task == "tactical_hierarchical_singlecombat"
+            and not self.task.use_artillery
+        )
 
     def seed(self, seed=None):
         seeds = super().seed(seed)
@@ -233,8 +241,12 @@ class SingleCombatRadarDegradationEnv(SingleCombatEnv):
         self._latest_radar_tracks = {}
         self._radar_track_steps = {}
         self._agent_levels = {}
+        episode_level = None
+        if self._share_episode_level and self.radar_level is None and self.agent_radar_levels is None:
+            # 每局只抽一次档位，双方的传感器随机流仍分别初始化。
+            episode_level = int(episode_rng.choice(len(RADAR_TRAIN_PROBABILITIES), p=RADAR_TRAIN_PROBABILITIES))
         for agent_id, child_seed in zip(self.agents.keys(), self._radar_episode_seeds.spawn(len(self.agents))):
-            level = self._choose_agent_level(agent_id, episode_rng)
+            level = episode_level if episode_level is not None else self._choose_agent_level(agent_id, episode_rng)
             self._agent_levels[agent_id] = level
             self._degraders[agent_id] = RadarTrackDegrader(
                 RADAR_DEGRADATION_SPECS[level], np.random.default_rng(child_seed)

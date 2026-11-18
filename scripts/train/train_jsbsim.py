@@ -12,6 +12,13 @@ from config import get_config
 from runner.experiment_tracking import create_run_dir, track_swanlab
 from runner.share_jsbsim_runner import ShareJSBSimRunner
 from envs.JSBSim.envs import SingleCombatEnv, SingleControlEnv, MultipleCombatEnv
+from envs.JSBSim.envs.selfplay_observation import (
+    OWN_SHIP_DEGRADATION_SPECS,
+    OWN_SHIP_EVAL_LEVEL,
+    OWN_SHIP_TRAIN_PROBABILITIES,
+    SELFPLAY_SCENARIO,
+    SelfplayOwnshipDegradationEnv,
+)
 from envs.JSBSim.envs.singlecombat_env import (
     RADAR_DEGRADATION_SPECS,
     RADAR_TRAIN_PROBABILITIES,
@@ -37,8 +44,15 @@ def make_train_env(all_args):
     def get_env_fn(rank):
         def init_env():
             if all_args.env_name == "SingleCombat":
-                env_type = SingleCombatRadarDegradationEnv if all_args.combat_radar_degradation else SingleCombatEnv
-                env = env_type(all_args.scenario_name)
+                if getattr(all_args, "selfplay_ownship_degradation", False):
+                    env = SelfplayOwnshipDegradationEnv(all_args.scenario_name)
+                elif all_args.combat_radar_degradation:
+                    env = SingleCombatRadarDegradationEnv(
+                        all_args.scenario_name,
+                        shared_episode_level=all_args.scenario_name == "1v1/NoWeapon/TacticalHierarchySelfplay",
+                    )
+                else:
+                    env = SingleCombatEnv(all_args.scenario_name)
             elif all_args.env_name == "SingleControl":
                 if all_args.heading_mixed_degradation:
                     env_type = HeadingMixedDegradationEnv
@@ -70,7 +84,9 @@ def make_eval_env(all_args):
     def get_env_fn(rank):
         def init_env():
             if all_args.env_name == "SingleCombat":
-                if all_args.combat_radar_degradation:
+                if getattr(all_args, "selfplay_ownship_degradation", False):
+                    env = SelfplayOwnshipDegradationEnv(all_args.scenario_name, degradation_level=OWN_SHIP_EVAL_LEVEL)
+                elif all_args.combat_radar_degradation:
                     env = SingleCombatRadarDegradationEnv(all_args.scenario_name, radar_level=HEADING_EVAL_NOISE_LEVEL)
                 else:
                     env = SingleCombatEnv(all_args.scenario_name)
@@ -120,6 +136,8 @@ def parse_args(args, parser):
                        help="Heading 训练采样按概率混合注入高斯噪声、零阶保持丢帧与队列时延，定期评估固定使用 E2 档")
     group.add_argument("--combat-radar-degradation", action="store_true",
                        help="SingleCombat 1v1 训练采样混合注入机载火控雷达航迹退化（噪声+丢帧+时延），评估固定使用 E2 档")
+    group.add_argument("--selfplay-ownship-degradation", action="store_true",
+                       help="普通无武器 Selfplay 的本机状态混合退化，训练采样 E0–E2，内置评估固定使用 E2")
     all_args = parser.parse_known_args(args)[0]
     if all_args.heading_measurement_noise and all_args.heading_mixed_degradation:
         parser.error("--heading-measurement-noise 与 --heading-mixed-degradation 互斥，请只传其中之一")
@@ -137,6 +155,11 @@ def parse_args(args, parser):
         all_args.env_name != "SingleCombat" or all_args.algorithm_name != "ppo"
     ):
         parser.error("--combat-radar-degradation 仅支持 SingleCombat 的 PPO 训练")
+    if all_args.selfplay_ownship_degradation:
+        if (all_args.env_name, all_args.scenario_name, all_args.algorithm_name) != ("SingleCombat", SELFPLAY_SCENARIO, "ppo") or not all_args.use_selfplay:
+            parser.error("--selfplay-ownship-degradation 仅支持普通无武器 Selfplay 的 PPO 训练")
+        if all_args.combat_radar_degradation:
+            parser.error("本机状态退化和雷达航迹退化互斥")
     if all_args.policy_loss == "spo" and (all_args.algorithm_name != "ppo"
             or all_args.env_name not in {"SingleControl", "SingleCombat"}):
         parser.error("SPO 仅支持 SingleControl / SingleCombat 的 PPO 训练，暂不支持 MAPPO / MultipleCombat")
@@ -179,6 +202,10 @@ def main(args):
     if all_args.combat_radar_degradation:
         logging.info("SingleCombat 雷达航迹退化：训练档位 %s，采样概率 %s",
                      RADAR_DEGRADATION_SPECS[:len(RADAR_TRAIN_PROBABILITIES)], RADAR_TRAIN_PROBABILITIES)
+    if all_args.selfplay_ownship_degradation:
+        logging.info("Selfplay 本机状态混合退化：档位 %s，采样概率 %s",
+                     OWN_SHIP_DEGRADATION_SPECS[:len(OWN_SHIP_TRAIN_PROBABILITIES)],
+                     OWN_SHIP_TRAIN_PROBABILITIES)
 
     # seed
     np.random.seed(all_args.seed) # 设置NumPy随机种子，all_args.seed固定时，每次生成的随机数一样

@@ -1,10 +1,10 @@
 #!/usr/bin/env python
-"""部分可观测鲁棒性与 GRU 历史信息有效性快速评估。
+"""使用冻结策略评估 1v1 观测退化下的鲁棒性。
 
 本脚本只加载已有 actor，不执行训练。Actor A 和 Actor B 可分别加载手动指定的模型：
-Actor A 是被测策略：E1-E3 注入由低到高的混合观测退化，
-E4-E6 在 E0 完整观测基础上按由大到小的周期清零 GRU 隐状态；
-Actor B 始终接收干净观测并正常保持 GRU 隐状态。
+普通无武器 Selfplay 默认以 E0 完整观测为基线，E1–E6 逐档增加 Actor A 本机状态的噪声、丢帧和时延。
+Actor B 始终接收完整观测，双方每回合按各自的编码器正常维护时序状态。
+使用 --ownship-degradation 可只评估 E0 和 E2。
 
 运行方式：
     python experiments/partial_observability_gru_eval.py
@@ -23,9 +23,12 @@ from collections import deque
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
+
+if TYPE_CHECKING:
+    from envs.JSBSim.envs.selfplay_observation import OwnshipDegradationSpec
 
 
 # =============================================================================
@@ -104,14 +107,6 @@ MIXED_DEGRADATION_PARAMETERS = {
     },
 }
 
-# E4-E6：均使用 E0 完整观测，只改变 GRU 隐状态清零间隔。
-# 清零间隔由大到小；1 表示每个决策步都清零，基本无法利用历史观测。
-GRU_RESET_INTERVALS = {
-    "E4": 20,                                   # 约每 4 秒清零
-    "E5": 5,                                    # 约每 1 秒清零
-    "E6": 1,                                    # 每步清零
-}
-
 # 优势窗口和动作连续性判据。
 ADVANTAGE_AO_MAX_DEG = 30.0
 ADVANTAGE_TA_MAX_DEG = 30.0
@@ -159,9 +154,9 @@ class ExperimentCondition:
 
     condition_id: str
     label: str
-    degradation: DegradationConfig
-    gru_reset_interval: Optional[int] = None
+    degradation: DegradationConfig | OwnshipDegradationSpec
     sensor_seed_group: int = 0
+    ownship_level: Optional[int] = None
 
 
 MIXED_DEGRADATION_CONFIGS = {
@@ -169,10 +164,7 @@ MIXED_DEGRADATION_CONFIGS = {
     for condition_id, parameters in MIXED_DEGRADATION_PARAMETERS.items()
 }
 
-ROBUSTNESS_CONDITION_IDS = ("E0", "E1", "E2", "E3")
-GRU_HISTORY_CONDITION_IDS = ("E0", "E4", "E5", "E6")
-
-EXPERIMENT_CONDITIONS: Tuple[ExperimentCondition, ...] = (
+RELATIVE_CONDITIONS: Tuple[ExperimentCondition, ...] = (
     ExperimentCondition(
         "E0",
         "完整观测",
@@ -197,32 +189,30 @@ EXPERIMENT_CONDITIONS: Tuple[ExperimentCondition, ...] = (
         MIXED_DEGRADATION_CONFIGS["E3"],
         sensor_seed_group=1,
     ),
-    ExperimentCondition(
-        "E4",
-        f"完整观测，每 {GRU_RESET_INTERVALS['E4']} 步清零 GRU",
-        DegradationConfig(),
-        gru_reset_interval=GRU_RESET_INTERVALS["E4"],
-        sensor_seed_group=0,
-    ),
-    ExperimentCondition(
-        "E5",
-        f"完整观测，每 {GRU_RESET_INTERVALS['E5']} 步清零 GRU",
-        DegradationConfig(),
-        gru_reset_interval=GRU_RESET_INTERVALS["E5"],
-        sensor_seed_group=0,
-    ),
-    ExperimentCondition(
-        "E6",
-        f"完整观测，每 {GRU_RESET_INTERVALS['E6']} 步清零 GRU",
-        DegradationConfig(),
-        gru_reset_interval=GRU_RESET_INTERVALS["E6"],
-        sensor_seed_group=0,
-    ),
 )
 
 
+def ownship_conditions(*, quick: bool) -> Tuple[ExperimentCondition, ...]:
+    from envs.JSBSim.envs.selfplay_observation import (
+        OWN_SHIP_DEGRADATION_SPECS,
+        OWN_SHIP_EVAL_LEVEL,
+    )
+
+    levels = (0, OWN_SHIP_EVAL_LEVEL) if quick else range(len(OWN_SHIP_DEGRADATION_SPECS))
+    return tuple(
+        ExperimentCondition(
+            f"E{level}",
+            "完整观测" if level == 0 else f"本机状态混合退化 E{level}",
+            OWN_SHIP_DEGRADATION_SPECS[level],
+            sensor_seed_group=int(level > 0),
+            ownship_level=level,
+        )
+        for level in levels
+    )
+
+
 def validate_experiment_design() -> None:
-    """检查可调参数仍满足两组实验的单变量与强度顺序要求。"""
+    """检查兼容模式的相对观测退化强度。"""
     degradation_fields = (
         "dropout_probability",
         "delay_steps",
@@ -260,17 +250,8 @@ def validate_experiment_design() -> None:
         ):
             raise ValueError("E1、E2、E3 的退化程度必须逐级增强。")
 
-    reset_intervals = [GRU_RESET_INTERVALS[item_id] for item_id in ("E4", "E5", "E6")]
-    if any(not isinstance(interval, int) or interval <= 0 for interval in reset_intervals):
-        raise ValueError("E4-E6 的 GRU 清零间隔必须为正整数。")
-    if not reset_intervals[0] > reset_intervals[1] > reset_intervals[2]:
-        raise ValueError("E4、E5、E6 的 GRU 清零间隔必须由大到小。")
-    if REWARD_MOVING_AVERAGE_WINDOW <= 0:
-        raise ValueError("奖励曲线滑动平均窗口必须为正整数。")
-
-
 # =============================================================================
-# 观测退化与 GRU 状态控制
+# 相对观测退化
 # =============================================================================
 
 
@@ -364,18 +345,6 @@ class ObservationDegrader:
                 f"观测必须是一维且至少包含 {RELATIVE_FEATURE_SLICE.stop} 个元素，当前形状={obs.shape}"
             )
         return obs
-
-
-def maybe_reset_actor_hidden(controller: Any, step: int, interval: Optional[int]) -> bool:
-    """按指定周期清零被测 actor 的主 GRU 隐状态。"""
-    if interval is None:
-        return False
-    if interval <= 0:
-        raise ValueError("GRU 清零间隔必须为正整数或 None。")
-    should_reset = interval == 1 or (step > 0 and step % interval == 0)
-    if should_reset:
-        controller.rnn_states = np.zeros_like(controller.rnn_states, dtype=np.float32)
-    return should_reset
 
 
 # =============================================================================
@@ -534,6 +503,8 @@ def run_episode(
     actor_a: Any,
     actor_b: Any,
     condition_dir: Path,
+    *,
+    save_acmi: bool = True,
 ) -> Dict[str, object]:
     actor_a.reset()
     actor_b.reset()
@@ -558,7 +529,11 @@ def run_episode(
     )
     use_radar_track_degrader = bool(getattr(actor_a, "is_tactical", False))
     radar_degrader = None
-    if use_radar_track_degrader:
+    if condition.ownship_level is not None:
+        from envs.JSBSim.envs.selfplay_observation import OwnshipObservationDegrader
+
+        degrader = OwnshipObservationDegrader(condition.ownship_level, obs[actor_a_slot], sensor_rng)
+    elif use_radar_track_degrader:
         from envs.JSBSim.envs.singlecombat_env import (
             RadarDegradationSpec,
             RadarTrackDegrader,
@@ -585,27 +560,21 @@ def run_episode(
     relative_history: Dict[str, List[float]] = {}
     normalized_actor_a_actions: List[np.ndarray] = []
     advantage_steps = 0
-    gru_reset_count = 0
 
     acmi_path: Optional[Path] = None
-    if SAVE_ACMI and episode in ACMI_EPISODES:
+    if save_acmi and SAVE_ACMI and episode in ACMI_EPISODES:
         acmi_dir = condition_dir / "acmi"
         acmi_dir.mkdir(parents=True, exist_ok=True)
         acmi_path = acmi_dir / f"episode_{episode:04d}.txt.acmi"
         env._create_records = False
         env.render(mode="txt", filepath=str(acmi_path))
 
-    step_index = 0
     while True:
         actions = []
         for slot, controller in enumerate(slot_controllers):
             controller_obs = obs[slot]
             agent_id = actor_to_agent_id[controller.name]
             if controller.name == "actor_a":
-                if maybe_reset_actor_hidden(
-                    controller, step_index, condition.gru_reset_interval
-                ):
-                    gru_reset_count += 1
                 if radar_degrader is not None:
                     from envs.JSBSim.envs.singlecombat_env import extract_true_enemy_track
 
@@ -656,7 +625,6 @@ def run_episode(
         if acmi_path is not None:
             env.render(mode="txt", filepath=str(acmi_path))
 
-        step_index += 1
         if bool(np.asarray(dones).all()):
             break
 
@@ -703,7 +671,6 @@ def run_episode(
         "actual_dropout_rate": (
             radar_degrader.actual_dropout_rate if radar_degrader is not None else degrader.actual_dropout_rate
         ),
-        "gru_reset_count": gru_reset_count,
         "acmi_path": str(acmi_path) if acmi_path is not None else "",
         **initial_summary,
         **terminal_summary,
@@ -761,6 +728,7 @@ def summarize_condition(
             np.mean([row["actor_a_status"] == "crash" for row in rows])
         ),
         "actor_a_avg_reward": float(np.mean(values("actor_a_reward"))),
+        "mean_reward_margin": float(np.mean(values("reward_margin"))),
         "advantage_window_occupancy": adv_mean,
         "advantage_window_occupancy_ci_low": adv_low,
         "advantage_window_occupancy_ci_high": adv_high,
@@ -777,7 +745,6 @@ def summarize_condition(
             np.mean(values("actor_a_large_action_jump_rate"))
         ),
         "actual_dropout_rate": float(np.mean(values("actual_dropout_rate"))),
-        "avg_gru_reset_count": float(np.mean(values("gru_reset_count"))),
     }
 
 
@@ -833,10 +800,6 @@ def plot_summaries(summaries: List[Dict[str, object]], output_dir: Path) -> List
     plot_dir.mkdir(parents=True, exist_ok=True)
     paths: List[Path] = []
 
-    def subset(ids: Sequence[str]) -> List[Dict[str, object]]:
-        mapping = {str(item["condition_id"]): item for item in summaries}
-        return [mapping[item_id] for item_id in ids]
-
     def error(summary: Dict[str, object], key: str) -> Tuple[float, float]:
         value = float(summary[key])
         return (
@@ -844,70 +807,42 @@ def plot_summaries(summaries: List[Dict[str, object]], output_dir: Path) -> List
             float(summary[f"{key}_ci_high"]) - value,
         )
 
-    robustness = subset(ROBUSTNESS_CONDITION_IDS)
     figure, axes = plt.subplots(2, 2, figsize=(11, 8))
-    ids = [str(item["condition_id"]) for item in robustness]
-    win_errors = np.asarray([error(item, "win_score") for item in robustness]).T
+    ids = [str(item["condition_id"]) for item in summaries]
+    win_errors = np.asarray([error(item, "win_score") for item in summaries]).T
     adv_errors = np.asarray(
-        [error(item, "advantage_window_occupancy") for item in robustness]
+        [error(item, "advantage_window_occupancy") for item in summaries]
     ).T
-    axes[0, 0].bar(ids, [item["win_score"] for item in robustness], yerr=win_errors, capsize=4)
+    axes[0, 0].bar(ids, [item["win_score"] for item in summaries], yerr=win_errors, capsize=4)
     axes[0, 0].set_title("部分可观测条件下的胜负得分")
     axes[0, 0].set_ylim(0.0, 1.0)
     axes[0, 0].set_ylabel("胜=1，平=0.5，负=0")
     axes[0, 1].bar(
         ids,
-        [item["advantage_window_occupancy"] for item in robustness],
+        [item["advantage_window_occupancy"] for item in summaries],
         yerr=adv_errors,
         capsize=4,
         color="#2ca02c",
     )
     axes[0, 1].set_title("优势窗口占用率")
     axes[0, 1].set_ylim(0.0, 1.0)
-    axes[1, 0].bar(ids, [item["actor_a_mean_ao_deg"] for item in robustness], color="#ff7f0e")
+    axes[1, 0].bar(ids, [item["actor_a_mean_ao_deg"] for item in summaries], color="#ff7f0e")
     axes[1, 0].set_title("平均 AO")
     axes[1, 0].set_ylabel("deg")
     axes[1, 1].bar(
         ids,
-        [float(item["mean_distance_m"]) / 1000.0 for item in robustness],
+        [float(item["mean_distance_m"]) / 1000.0 for item in summaries],
         color="#9467bd",
     )
     axes[1, 1].set_title("平均相对距离")
     axes[1, 1].set_ylabel("km")
-    figure.suptitle("实验一：部分可观测鲁棒性")
+    figure.suptitle("混合观测退化下的鲁棒性")
     figure.tight_layout()
     path = plot_dir / "experiment_1_partial_observability.png"
     figure.savefig(path, dpi=PLOT_DPI, bbox_inches="tight")
     plt.close(figure)
     paths.append(path)
 
-    memory = subset(GRU_HISTORY_CONDITION_IDS)
-    figure, axes = plt.subplots(2, 2, figsize=(11, 8))
-    ids = [str(item["condition_id"]) for item in memory]
-    axes[0, 0].bar(ids, [item["actor_a_win_rate"] for item in memory], color="#1f77b4")
-    axes[0, 0].set_title("Actor A 胜率")
-    axes[0, 0].set_ylim(0.0, 1.0)
-    axes[0, 1].bar(ids, [item["actor_a_avg_reward"] for item in memory], color="#ff7f0e")
-    axes[0, 1].set_title("Actor A 平均回报")
-    axes[1, 0].bar(
-        ids,
-        [item["advantage_window_occupancy"] for item in memory],
-        color="#2ca02c",
-    )
-    axes[1, 0].set_title("优势窗口占用率")
-    axes[1, 0].set_ylim(0.0, 1.0)
-    axes[1, 1].bar(
-        ids,
-        [item["actor_a_action_total_variation"] for item in memory],
-        color="#d62728",
-    )
-    axes[1, 1].set_title("平均动作总变差")
-    figure.suptitle("实验二：完整观测下的 GRU 历史信息有效性")
-    figure.tight_layout()
-    path = plot_dir / "experiment_2_gru_history.png"
-    figure.savefig(path, dpi=PLOT_DPI, bbox_inches="tight")
-    plt.close(figure)
-    paths.append(path)
     return paths
 
 
@@ -935,65 +870,33 @@ def trailing_moving_average(values: Sequence[float], window: int) -> np.ndarray:
 def plot_episode_reward_curves(
     rows: List[Dict[str, object]], output_dir: Path
 ) -> List[Path]:
-    """绘制两组 Actor A 单局奖励及其滑动平均曲线。"""
+    """绘制各退化档位的 Actor A 单局奖励及其滑动平均。"""
     plt = load_pyplot()
     if plt is None:
         return []
 
     plot_dir = output_dir / "plots"
     plot_dir.mkdir(parents=True, exist_ok=True)
-    figure, axes = plt.subplots(1, 2, figsize=(15, 5), sharex=True)
-    groups = (
-        ("实验一：混合观测退化", ROBUSTNESS_CONDITION_IDS),
-        ("实验二：完整观测下的 GRU 历史消融", GRU_HISTORY_CONDITION_IDS),
-    )
+    figure, axis = plt.subplots(figsize=(12, 5))
+    condition_ids = dict.fromkeys(str(row["condition_id"]) for row in rows)
     colors = plt.get_cmap("tab10").colors
 
-    for axis, (title, condition_ids) in zip(axes, groups):
-        for color_index, condition_id in enumerate(condition_ids):
-            condition_rows = sorted(
-                (
-                    row
-                    for row in rows
-                    if str(row["condition_id"]) == condition_id
-                ),
-                key=lambda row: int(row["episode"]),
-            )
-            if not condition_rows:
-                raise ValueError(f"缺少 {condition_id} 的单局奖励数据，无法绘图。")
+    for color_index, condition_id in enumerate(condition_ids):
+        condition_rows = sorted(
+            (row for row in rows if str(row["condition_id"]) == condition_id),
+            key=lambda row: int(row["episode"]),
+        )
+        episodes = np.asarray([int(row["episode"]) + 1 for row in condition_rows], dtype=np.int64)
+        rewards = np.asarray([float(row["actor_a_reward"]) for row in condition_rows], dtype=np.float64)
+        smoothed = trailing_moving_average(rewards, REWARD_MOVING_AVERAGE_WINDOW)
+        color = colors[color_index % len(colors)]
+        axis.plot(episodes, rewards, color=color, alpha=0.22, linewidth=0.9)
+        axis.plot(episodes, smoothed, color=color, linewidth=2.0, label=condition_id)
 
-            episodes = np.asarray(
-                [int(row["episode"]) + 1 for row in condition_rows],
-                dtype=np.int64,
-            )
-            rewards = np.asarray(
-                [float(row["actor_a_reward"]) for row in condition_rows],
-                dtype=np.float64,
-            )
-            smoothed = trailing_moving_average(
-                rewards, REWARD_MOVING_AVERAGE_WINDOW
-            )
-            color = colors[color_index % len(colors)]
-            axis.plot(
-                episodes,
-                rewards,
-                color=color,
-                alpha=0.22,
-                linewidth=0.9,
-            )
-            axis.plot(
-                episodes,
-                smoothed,
-                color=color,
-                linewidth=2.0,
-                label=f"{condition_id} 滑动平均",
-            )
-
-        axis.set_title(title)
-        axis.set_xlabel("测试局数")
-        axis.set_ylabel("Actor A 单局累计奖励")
-        axis.grid(alpha=0.25)
-        axis.legend()
+    axis.set_xlabel("测试局数")
+    axis.set_ylabel("Actor A 单局累计奖励")
+    axis.grid(alpha=0.25)
+    axis.legend()
 
     figure.suptitle(
         "Actor A 单局奖励曲线"
@@ -1006,7 +909,9 @@ def plot_episode_reward_curves(
     return [path]
 
 
-def config_snapshot(actor_a_path: Path, actor_b_path: Path) -> Dict[str, object]:
+def config_snapshot(
+    actor_a_path: Path, actor_b_path: Path, conditions: Sequence[ExperimentCondition]
+) -> Dict[str, object]:
     return {
         "actor_a_path": str(actor_a_path),
         "actor_b_path": str(actor_b_path),
@@ -1028,19 +933,13 @@ def config_snapshot(actor_a_path: Path, actor_b_path: Path) -> Dict[str, object]
             "ta_max_deg": ADVANTAGE_TA_MAX_DEG,
             "distance_max_m": ADVANTAGE_DISTANCE_MAX_M,
         },
-        "conditions": [
-            {
-                **asdict(condition),
-                "degradation": asdict(condition.degradation),
-            }
-            for condition in EXPERIMENT_CONDITIONS
-        ],
+        "conditions": [asdict(condition) for condition in conditions],
     }
 
 
 def parse_cli_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     """支持命令行覆盖路径、场景、局数和设备；无参数时沿用顶部配置。"""
-    parser = argparse.ArgumentParser(description="1v1 部分可观测鲁棒性与记忆有效性评估")
+    parser = argparse.ArgumentParser(description="普通无武器 Selfplay 的 E0–E6 观测退化评估")
     parser.add_argument("--actor-a-path", type=Path, default=None, help="被测 Actor A 权重或目录")
     parser.add_argument("--actor-b-path", type=Path, default=None, help="对手 Actor B 权重或目录")
     parser.add_argument("--actor-a-scenario", type=str, default=None, help="Actor A 训练场景名")
@@ -1049,6 +948,8 @@ def parse_cli_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--episodes", type=int, default=None, help="每个实验条件运行的对局数")
     parser.add_argument("--device", type=str, default=None, help="推理设备，如 auto / cpu / cuda:0")
     parser.add_argument("--output-dir", type=Path, default=None, help="自定义结果输出目录")
+    parser.add_argument("--ownship-degradation", action="store_true",
+                        help="只运行普通无武器 Selfplay 的 E0/E2 快验，默认运行 E0–E6")
     return parser.parse_args(argv)
 
 
@@ -1062,7 +963,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
 
     if num_episodes <= 0:
         raise ValueError("NUM_EPISODES_PER_CONDITION 必须为正整数。")
-    validate_experiment_design()
+    if REWARD_MOVING_AVERAGE_WINDOW <= 0:
+        raise ValueError("奖励曲线滑动平均窗口必须为正整数。")
 
     validate_scenario_configs(
         (actor_a_scenario, actor_b_scenario, eval_scenario)
@@ -1072,6 +974,19 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
 
     base = load_base_eval_module()
     configure_base_module(base)
+    from envs.JSBSim.envs.selfplay_observation import SELFPLAY_SCENARIO, validate_unarmed_selfplay
+
+    use_ownship = (actor_a_scenario, actor_b_scenario, eval_scenario) == (SELFPLAY_SCENARIO,) * 3
+    if cli.ownship_degradation and not use_ownship:
+        raise ValueError("本机状态退化快验的双方模型和评估环境都须使用普通无武器 Selfplay")
+    if use_ownship:
+        from envs.JSBSim.utils.utils import parse_config
+
+        validate_unarmed_selfplay(parse_config(SELFPLAY_SCENARIO))
+        conditions = ownship_conditions(quick=cli.ownship_degradation)
+    else:
+        validate_experiment_design()
+        conditions = RELATIVE_CONDITIONS
     np.random.seed(ENV_SEED)
     base.torch.manual_seed(ENV_SEED)
     device = base.resolve_device(device_name)
@@ -1079,13 +994,14 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_dir = (cli.output_dir.resolve() if cli.output_dir is not None else OUTPUT_ROOT / f"run_{timestamp}")
     output_dir.mkdir(parents=True, exist_ok=True)
-    snapshot = config_snapshot(actor_a_path, actor_b_path)
+    snapshot = config_snapshot(actor_a_path, actor_b_path, conditions)
     snapshot.update({
         "actor_a_scenario_name": actor_a_scenario,
         "actor_b_scenario_name": actor_b_scenario,
         "eval_scenario_name": eval_scenario,
         "num_episodes_per_condition": num_episodes,
         "device": str(device),
+        "observation_mode": "ownship_degradation" if use_ownship else "relative_degradation",
     })
     save_json(snapshot, output_dir / "config.json")
 
@@ -1108,7 +1024,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
 
     all_rows: List[Dict[str, object]] = []
     summaries: List[Dict[str, object]] = []
-    for condition_index, condition in enumerate(EXPERIMENT_CONDITIONS):
+    for condition_index, condition in enumerate(conditions):
         print(f"\n===== {condition.condition_id}: {condition.label} =====")
         condition_dir = output_dir / condition.condition_id
         condition_dir.mkdir(parents=True, exist_ok=True)
@@ -1125,6 +1041,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                     actor_a,
                     actor_b,
                     condition_dir,
+                    save_acmi=not cli.ownship_degradation,
                 )
                 for episode in range(num_episodes)
             ]
@@ -1159,11 +1076,16 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 float(summary["actor_a_avg_reward"])
                 - float(baseline["actor_a_avg_reward"])
             )
+            summary["reward_margin_drop_from_e0"] = (
+                float(baseline["mean_reward_margin"]) - float(summary["mean_reward_margin"])
+            )
 
     save_csv(all_rows, output_dir / "all_episodes.csv")
     save_csv(summaries, output_dir / "summary.csv")
-    plot_paths = plot_summaries(summaries, output_dir)
-    plot_paths.extend(plot_episode_reward_curves(all_rows, output_dir))
+    plot_paths = []
+    if not cli.ownship_degradation:
+        plot_paths = plot_summaries(summaries, output_dir)
+        plot_paths.extend(plot_episode_reward_curves(all_rows, output_dir))
     combined_summary = {
         "output_dir": str(output_dir),
         "conditions": summaries,

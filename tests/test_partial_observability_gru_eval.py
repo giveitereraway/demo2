@@ -1,24 +1,18 @@
-from types import SimpleNamespace
-
 import numpy as np
 import pytest
 
 from experiments.partial_observability_gru_eval import (
     AO_INDEX,
     DISTANCE_INDEX,
-    EXPERIMENT_CONDITIONS,
-    GRU_HISTORY_CONDITION_IDS,
-    GRU_RESET_INTERVALS,
     MIXED_DEGRADATION_CONFIGS,
     RELATIVE_FEATURE_SLICE,
-    ROBUSTNESS_CONDITION_IDS,
+    RELATIVE_CONDITIONS,
     TA_INDEX,
     DegradationConfig,
     ObservationDegrader,
     action_continuity_metrics,
     plot_episode_reward_curves,
     plot_summaries,
-    maybe_reset_actor_hidden,
     resolve_actor_path,
     scenario_config_path,
     trailing_moving_average,
@@ -106,49 +100,12 @@ def test_noise_is_reproducible_and_only_changes_configured_features():
     np.testing.assert_allclose(first_output[[9, 10, 14]], obs[[9, 10, 14]])
 
 
-def test_gru_hidden_reset_obeys_interval():
-    controller = SimpleNamespace(rnn_states=np.ones((1, 1, 4), dtype=np.float32))
-
-    assert not maybe_reset_actor_hidden(controller, step=4, interval=5)
-    np.testing.assert_allclose(controller.rnn_states, 1.0)
-    assert maybe_reset_actor_hidden(controller, step=5, interval=5)
-    np.testing.assert_allclose(controller.rnn_states, 0.0)
-
-    controller.rnn_states.fill(1.0)
-    assert maybe_reset_actor_hidden(controller, step=0, interval=1)
-    np.testing.assert_allclose(controller.rnn_states, 0.0)
-
-
-def test_gru_ablation_uses_e0_complete_observation_baseline():
-    conditions = {
-        condition.condition_id: condition for condition in EXPERIMENT_CONDITIONS
-    }
-
-    assert GRU_HISTORY_CONDITION_IDS == ("E0", "E4", "E5", "E6")
-    assert conditions["E0"].degradation == DegradationConfig()
-    for condition_id in ("E4", "E5", "E6"):
-        assert conditions[condition_id].degradation == conditions["E0"].degradation
-        assert (
-            conditions[condition_id].sensor_seed_group
-            == conditions["E0"].sensor_seed_group
-        )
-        assert (
-            conditions[condition_id].gru_reset_interval
-            == GRU_RESET_INTERVALS[condition_id]
-        )
-    assert conditions["E0"].gru_reset_interval is None
-    assert (
-        GRU_RESET_INTERVALS["E4"]
-        > GRU_RESET_INTERVALS["E5"]
-        > GRU_RESET_INTERVALS["E6"]
-    )
-
-
 def test_mixed_degradation_increases_from_e1_to_e3():
     conditions = {
-        condition.condition_id: condition for condition in EXPERIMENT_CONDITIONS
+        condition.condition_id: condition for condition in RELATIVE_CONDITIONS
     }
-    assert ROBUSTNESS_CONDITION_IDS == ("E0", "E1", "E2", "E3")
+    assert tuple(conditions) == ("E0", "E1", "E2", "E3")
+    assert conditions["E0"].degradation == DegradationConfig()
     configs = [conditions[item_id].degradation for item_id in ("E1", "E2", "E3")]
     assert configs == [
         MIXED_DEGRADATION_CONFIGS[item_id] for item_id in ("E1", "E2", "E3")
@@ -238,11 +195,11 @@ def test_summary_plot_accepts_advantage_confidence_interval(tmp_path, monkeypatc
 
     paths = plot_summaries(summaries, tmp_path)
 
-    assert len(paths) == 2
+    assert len(paths) == 1
     assert all(path.is_file() for path in paths)
 
 
-def test_episode_reward_curves_include_both_experiment_groups(tmp_path, monkeypatch):
+def test_episode_reward_curves_include_all_degradation_levels(tmp_path, monkeypatch):
     pytest.importorskip("matplotlib")
     import experiments.partial_observability_gru_eval as module
 

@@ -276,6 +276,28 @@ def test_heading_mixed_degradation_env_isolates_error_channels_and_preserves_phy
         eval_vec.close()
 
 
+def test_tactical_selfplay_radar_shares_training_level_per_episode():
+    from scripts.train.train_jsbsim import make_train_env, parse_args
+
+    args = parse_args(
+        ["--env-name", "SingleCombat", "--scenario-name", "1v1/NoWeapon/TacticalHierarchySelfplay",
+         "--combat-radar-degradation", "--n-rollout-threads", "1", "--seed", "7"],
+        get_config(),
+    )
+    train_vec = make_train_env(args)
+    try:
+        env = train_vec.envs[0]
+        sampled_levels = set()
+        for _ in range(16):
+            env.reset()
+            level_a, level_b = env._agent_levels.values()
+            assert level_a == level_b
+            sampled_levels.add(level_a)
+        assert sampled_levels == {0, 1, 2}
+    finally:
+        train_vec.close()
+
+
 def test_radar_degradation_eliminates_tactical_combat_geometry_ground_truth_leak():
     """验证 1v1 战术分层在雷达全丢帧下，观测与 _combat_geometry 同步冻结在初始航迹，不泄露敌机新真值位置。"""
     from envs.JSBSim.envs.singlecombat_env import (
@@ -456,7 +478,7 @@ def test_end_to_end_smoke_training_and_evaluators_for_gru_attention(tmp_path):
         try:
             base_1v1.validate_setup(direct_env, [ctrl_a, ctrl_b])
             ep_row = po_eval.run_episode(
-                base_1v1, po_eval.EXPERIMENT_CONDITIONS[1], 0,
+                base_1v1, po_eval.RELATIVE_CONDITIONS[1], 0,
                 direct_env, ctrl_a, ctrl_b, tmp_path / "po_out",
             )
             assert ep_row["steps"] == 3
