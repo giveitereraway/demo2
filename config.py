@@ -31,7 +31,7 @@ def _get_prepare_config(parser: argparse.ArgumentParser):
         --env-name <str>
             specify the name of environment
         --algorithm-name <str>
-            specifiy the algorithm, including `["ppo", "mappo"]`
+            选择 PPO、MAPPO 或 Heading 专用离策略基线。
         --experiment-name <str>
             an identifier to distinguish different experiment.
         --seed <int>
@@ -56,8 +56,8 @@ def _get_prepare_config(parser: argparse.ArgumentParser):
     group = parser.add_argument_group("Prepare parameters")
     group.add_argument("--env-name", type=str, default='JSBSim',
                        help="specify the name of environment")
-    group.add_argument("--algorithm-name", type=str, default='ppo', choices=["ppo", "mappo"],
-                       help="Specifiy the algorithm (default ppo)")
+    group.add_argument("--algorithm-name", type=str, default='ppo', choices=["ppo", "mappo", "sac", "bdq"],
+                       help="选择 PPO、MAPPO 或 Heading 基线 sac（因子化离散 SAC）、bdq（分支 DQN）")
     group.add_argument("--experiment-name", type=str, default="check",
                        help="An identifier to distinguish different experiment.")
     group.add_argument("--seed", type=int, default=1,
@@ -150,7 +150,7 @@ def _get_recurrent_config(parser: argparse.ArgumentParser):
             Time length of chunks used to train a recurrent_policy, default 10.
     """
     group = parser.add_argument_group("Recurrent parameters")
-    group.add_argument("--memory-encoder", choices=["mlp", "gru", "temporal_attention", "gru_attention"], default=None,
+    group.add_argument("--memory-encoder", choices=["mlp", "gru", "lstm", "temporal_attention", "gru_attention"], default=None,
                        help="选择记忆编码器；gru_attention 为递归滤波与历史因果注意力门控融合")
     group.add_argument("--history-length", type=int, default=16,
                        help="注意力窗口帧数，包含当前帧（默认 16）")

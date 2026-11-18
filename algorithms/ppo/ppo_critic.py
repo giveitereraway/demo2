@@ -3,6 +3,7 @@ import torch.nn as nn
 
 from ..utils.mlp import MLPBase, MLPLayer
 from ..utils.gru import GRULayer
+from ..utils.lstm import LSTMLayer
 from ..utils.temporal_attention import (
     GatedAttentionGRU,
     TemporalAttention,
@@ -21,7 +22,7 @@ class PPOCritic(nn.Module):
         self.activation_id = args.activation_id
         self.use_feature_normalization = args.use_feature_normalization
         self.memory_encoder = get_memory_encoder(args)
-        self.use_recurrent_policy = self.memory_encoder == "gru"
+        self.use_recurrent_policy = self.memory_encoder in {"gru", "lstm"}
         self.state_shape = get_policy_state_shape(args, obs_space)
         self.recurrent_hidden_size = args.recurrent_hidden_size
         self.recurrent_hidden_layers = args.recurrent_hidden_layers
@@ -36,7 +37,8 @@ class PPOCritic(nn.Module):
         # (2) rnn module
         input_size = self.base.output_size
         if self.use_recurrent_policy:
-            self.rnn = GRULayer(input_size, self.recurrent_hidden_size, self.recurrent_hidden_layers)
+            recurrent_layer = LSTMLayer if self.memory_encoder == "lstm" else GRULayer
+            self.rnn = recurrent_layer(input_size, self.recurrent_hidden_size, self.recurrent_hidden_layers)
             input_size = self.rnn.output_size
         # (3) value module
         if len(self.act_hidden_size) > 0:

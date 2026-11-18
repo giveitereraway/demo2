@@ -2,8 +2,8 @@
 """用单条阶跃指令或固定指令序列评估 heading 策略的观测退化鲁棒性。
 
 传入一个或多个 actor 权重文件，也可传入包含 actor_latest.pt 的单次训练目录。
-MLP 和注意力权重需要同目录的 model_config.json。PPO/SPO 标签由模型参数指定，
-两者推理都使用 PPOActor。
+MLP、LSTM、注意力和离策略模型权重需要同目录的 model_config.json。
+PPO/SPO 图例由参数名指定；SAC 与 BDQ 从配置加载对应网络。
 """
 
 from __future__ import annotations
@@ -27,18 +27,23 @@ if str(REPO_ROOT) not in sys.path:
 
 from experiments import evaluate_lowlevel_controller as heading
 from experiments.partial_observability_gru_eval import save_csv, save_json
+from algorithms.heading_baselines import HeadingBaselineActor
 from envs.JSBSim.envs.singlecontrol_env import HEADING_MEASUREMENT_NOISE_STD, HeadingMeasurementNoiseEnv
 
 
 MODEL_ENCODERS = {
     "ppo-gru": "gru",
+    "ppo-lstm": "lstm",
     "ppo-gru-attention": "gru_attention",
     "ppo-attention": "temporal_attention",
     "ppo-mlp": "mlp",
     "spo-gru": "gru",
+    "spo-lstm": "lstm",
     "spo-gru-attention": "gru_attention",
     "spo-attention": "temporal_attention",
     "spo-mlp": "mlp",
+    "sac-mlp": "mlp",
+    "bdq-mlp": "mlp",
 }
 OUTPUT_ROOT = REPO_ROOT / "experiments" / "results" / "chapter_3" /"observation_degradation" / "heading_observation_degradation"
 SENSOR_SEED = 31001
@@ -133,7 +138,8 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def load_actor(path: Path, encoder: str, device: torch.device, *, prefer_best: bool = False) -> tuple[Path, heading.PPOActor]:
+def load_actor(path: Path, encoder: str, device: torch.device, *, prefer_best: bool = False,
+               algorithm: str = "ppo") -> tuple[Path, heading.PPOActor | HeadingBaselineActor]:
     path = path.resolve()
     if path.is_dir():
         best_candidate = path / "actor_best.pt"
@@ -143,6 +149,11 @@ def load_actor(path: Path, encoder: str, device: torch.device, *, prefer_best: b
     if encoder != "gru" and not path.with_name("model_config.json").is_file():
         raise FileNotFoundError(f"{encoder} 权重缺少同目录的 model_config.json：{path}")
     actor = heading.build_actor(path, device)
+    loaded_algorithm = "ppo"
+    if isinstance(actor, HeadingBaselineActor):
+        loaded_algorithm = "bdq" if actor.dueling else "sac"
+    if loaded_algorithm != algorithm:
+        raise ValueError(f"模型 {path} 属于 {loaded_algorithm}，期望 {algorithm}")
     if actor.memory_encoder != encoder:
         raise ValueError(f"模型 {path} 的编码器为 {actor.memory_encoder}，期望 {encoder}")
     if actor.use_prior:
@@ -153,7 +164,7 @@ def load_actor(path: Path, encoder: str, device: torch.device, *, prefer_best: b
 @torch.inference_mode()
 def run_trial(
     env: heading.SingleControlEnv,
-    actor: heading.PPOActor,
+    actor: heading.PPOActor | HeadingBaselineActor,
     condition: Condition,
     trial_id: int,
     seed: int,
@@ -187,7 +198,7 @@ def run_trial(
             # 切换后立即计算新目标误差，沿用当前回合的退化队列。
             obs = env.get_obs()[heading.AGENT_ID].astype(np.float32)
         policy_obs = degrader.transform(obs) if degrader is not None else obs
-        action, _, state = actor(policy_obs[None, :], state, masks, deterministic=True)
+        action, state = heading.predict_action(actor, policy_obs[None, :], state, masks)
         if actor.memory_encoder == "gru_attention" and hasattr(actor.base, "last_gate_mean"):
             gate_values.append(float(actor.base.last_gate_mean))
         action = action.cpu().numpy().astype(np.int64)
@@ -304,7 +315,8 @@ def main() -> None:
     if device.type == "cpu":
         torch.set_num_threads(1)
     models = {
-        name: load_actor(path, MODEL_ENCODERS[name], device, prefer_best=args.prefer_best)
+        name: load_actor(path, MODEL_ENCODERS[name], device, prefer_best=args.prefer_best,
+                         algorithm="ppo" if name.startswith("spo-") else name.split("-", 1)[0])
         for name, path in args.models.items()
     }
     seeds = heading.SEEDS[:1 if args.quick else args.num_seeds]

@@ -92,6 +92,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from algorithms.ppo.ppo_actor import PPOActor  # noqa: E402
+from algorithms.heading_baselines import HEADING_BASELINES, HeadingBaselineActor  # noqa: E402
 from envs.JSBSim.core.catalog import Catalog as c  # noqa: E402
 from envs.JSBSim.envs.singlecontrol_env import SingleControlEnv  # noqa: E402
 
@@ -169,7 +170,7 @@ def set_random_seed(seed: int) -> None:
     torch.manual_seed(seed)
 
 
-def build_actor(model_path: Path, device: torch.device) -> PPOActor:
+def build_actor(model_path: Path, device: torch.device) -> PPOActor | HeadingBaselineActor:
     args = SimpleNamespace(
         gain=ACTOR_GAIN,
         hidden_size=ACTOR_HIDDEN_SIZE,
@@ -185,17 +186,26 @@ def build_actor(model_path: Path, device: torch.device) -> PPOActor:
     act_space = spaces.MultiDiscrete([41, 41, 41, 30])
     config_path = model_path.with_name("model_config.json")
     config = json.loads(config_path.read_text(encoding="utf-8")) if config_path.exists() else None
+    actor_type = PPOActor
     if config is not None:
         if config["observation_space"] != str(obs_space) or config["action_space"] != str(act_space):
             raise ValueError(f"{config_path} 的观测或动作空间与 Heading 任务不匹配")
         args.memory_encoder = config["memory_encoder"]
+        args.algorithm_name = config.get("algorithm_name", "ppo")
         args.hidden_size = config["hidden_size"]
         args.act_hidden_size = config["act_hidden_size"]
         args.activation_id = config["activation_id"]
         args.use_feature_normalization = config["use_feature_normalization"]
         args.use_prior = config["use_prior"]
-        if args.memory_encoder in {"mlp", "gru"}:
+        if args.algorithm_name in HEADING_BASELINES:
+            if args.memory_encoder != "mlp" or args.use_prior:
+                raise ValueError(f"{config_path} 的 Heading 离策略模型必须使用 MLP")
+            actor_type = HeadingBaselineActor
+        elif args.memory_encoder in {"mlp", "gru"}:
             args.recurrent_hidden_layers, args.recurrent_hidden_size = config["state_shape"]
+        elif args.memory_encoder == "lstm":
+            args.recurrent_hidden_size = config["recurrent_hidden_size"]
+            args.recurrent_hidden_layers = config["recurrent_hidden_layers"]
         elif args.memory_encoder == "temporal_attention":
             args.history_length = config["history_length"]
             args.attention_hidden_size = config["attention_hidden_size"]
@@ -208,7 +218,7 @@ def build_actor(model_path: Path, device: torch.device) -> PPOActor:
             args.attention_heads = config["attention_heads"]
         else:
             raise ValueError(f"{config_path} 的编码器不受支持：{args.memory_encoder}")
-    actor = PPOActor(args, obs_space, act_space, device=device)
+    actor = actor_type(args, obs_space, act_space, device=device)
     if config is not None and tuple(config["state_shape"]) != actor.state_shape:
         raise ValueError(f"{config_path} 的状态尺寸与 actor 不匹配，期望 {actor.state_shape}")
     try:
@@ -222,6 +232,13 @@ def build_actor(model_path: Path, device: torch.device) -> PPOActor:
     actor.eval()
     actor.requires_grad_(False)
     return actor
+
+
+def predict_action(actor, obs, state, masks):
+    if isinstance(actor, HeadingBaselineActor):
+        return actor.act(obs, state, masks, deterministic=True)
+    actions, _, state = actor(obs, state, masks, deterministic=True)
+    return actions, state
 
 
 def build_commands(quick: bool = False) -> list[Command]:
@@ -537,7 +554,7 @@ def summarize_trial(
 
 def run_trial(
     env: SingleControlEnv,
-    actor: PPOActor,
+    actor: PPOActor | HeadingBaselineActor,
     trial_id: int,
     seed: int,
     command: Command | None,
@@ -565,12 +582,7 @@ def run_trial(
         obs = env.task.get_obs(env, AGENT_ID).astype(np.float32)
         obs = np.expand_dims(obs, axis=0)
         with torch.no_grad():
-            action_tensor, _, next_state = actor(
-                obs,
-                policy_state,
-                masks,
-                deterministic=True,
-            )
+            action_tensor, next_state = predict_action(actor, obs, policy_state, masks)
         action = action_tensor.detach().cpu().numpy().reshape(1, -1).astype(np.int64)
         policy_state = next_state.detach().cpu().numpy()
 

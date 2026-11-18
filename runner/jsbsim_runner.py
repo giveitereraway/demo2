@@ -41,8 +41,14 @@ class JSBSimRunner(Runner):
         start = time.time()
         self.total_num_steps = 0
         episodes = self.num_env_steps // self.buffer_size // self.n_rollout_threads # 1041步
+        heading = self.env_name == "SingleControl" and self.all_args.scenario_name == "1/heading"
+        if heading:
+            episodes = self.heading_training_rounds()
+            episode_returns = np.zeros(self.n_rollout_threads)
 
         for episode in range(episodes):
+            round_start = time.perf_counter()
+            completed_returns = []
 
             heading_turns_list = []
 
@@ -54,6 +60,11 @@ class JSBSimRunner(Runner):
 
                 # Obser reward and next obs 获取新观测和奖励
                 obs, rewards, dones, infos = self.envs.step(actions)
+                if heading:
+                    finished = dones.reshape(-1).astype(bool)
+                    episode_returns += rewards.reshape(-1)
+                    completed_returns.extend(episode_returns[finished])
+                    episode_returns[finished] = 0
 
                 # Extra recorded information
                 for info in infos:
@@ -68,12 +79,14 @@ class JSBSimRunner(Runner):
             # compute return and update network
             self.compute() # 计算回报函数
             train_infos = self.train() # 更新策略和价值网络
+            if heading:
+                train_infos.update(self.heading_training_metrics(round_start))
 
             # post process
             self.total_num_steps = (episode + 1) * self.buffer_size * self.n_rollout_threads
 
             # log information
-            if episode % self.log_interval == 0:
+            if episode % self.log_interval == 0 or (heading and episode + 1 == episodes):
                 end = time.time()
                 logging.info("\n Scenario {} Algo {} Exp {} updates {}/{} episodes, total num timesteps {}/{}, FPS {}.\n"
                              .format(self.all_args.scenario_name,
@@ -85,8 +98,12 @@ class JSBSimRunner(Runner):
                                      self.num_env_steps,
                                      int(self.total_num_steps / (end - start))))
 
-                train_infos["average_episode_rewards"] = self.buffer.rewards.sum() / (self.buffer.masks == False).sum()
-                logging.info("average episode rewards is {}".format(train_infos["average_episode_rewards"]))
+                if heading and completed_returns:
+                    train_infos["average_episode_rewards"] = np.mean(completed_returns)
+                elif not heading:
+                    train_infos["average_episode_rewards"] = self.buffer.rewards.sum() / (self.buffer.masks == False).sum()
+                if "average_episode_rewards" in train_infos:
+                    logging.info("average episode rewards is %s", train_infos["average_episode_rewards"])
 
                 if len(heading_turns_list):
                     train_infos["average_heading_turns"] = np.mean(heading_turns_list)
@@ -112,6 +129,27 @@ class JSBSimRunner(Runner):
         obs = self.envs.reset()
         self.buffer.step = 0
         self.buffer.obs[0] = obs.copy()
+
+    def heading_training_rounds(self):
+        steps_per_round = self.buffer_size * self.n_rollout_threads
+        rounds, remainder = divmod(self.num_env_steps, steps_per_round)
+        if remainder:
+            logging.info("Heading 按完整采样周期训练，实际预算为 %d 环境步", rounds * steps_per_round)
+        self.heading_metrics = {
+            "actor_parameters": sum(p.numel() for p in self.policy.actor.parameters()),
+            "critic_parameters": sum(p.numel() for p in self.policy.critic.parameters())
+            if hasattr(self.policy, "critic") else 0,
+            "training_elapsed_seconds": 0.0,
+        }
+        logging.info("Heading 参数量：Actor %d，Critic %d", self.heading_metrics["actor_parameters"],
+                     self.heading_metrics["critic_parameters"])
+        return rounds
+
+    def heading_training_metrics(self, round_start):
+        if torch.device(self.device).type == "cuda":
+            torch.cuda.synchronize(self.device)
+        self.heading_metrics["training_elapsed_seconds"] += time.perf_counter() - round_start
+        return self.heading_metrics
 
     @torch.no_grad()
     def collect(self, step):
@@ -148,7 +186,7 @@ class JSBSimRunner(Runner):
     def eval(self, total_num_steps):
         logging.info("\nStart evaluation...")
         total_episodes, eval_episode_rewards = 0, []
-        eval_cumulative_rewards = np.zeros((self.n_eval_rollout_threads, *self.buffer.rewards.shape[2:]), dtype=np.float32)
+        eval_cumulative_rewards = np.zeros((self.n_eval_rollout_threads, self.num_agents, 1), dtype=np.float32)
 
         tracking = getattr(self.all_args, "heading_first_target", False)
         if tracking:
@@ -162,8 +200,9 @@ class JSBSimRunner(Runner):
             eval_obs = self.eval_envs.reset(seeds=[seed + int(rank) for rank in ranks])
         else:
             eval_obs = self.eval_envs.reset()
-        eval_masks = np.ones((self.n_eval_rollout_threads, *self.buffer.masks.shape[2:]), dtype=np.float32)
-        eval_rnn_states = np.zeros((self.n_eval_rollout_threads, *self.buffer.rnn_states_actor.shape[2:]), dtype=np.float32)
+        eval_masks = np.ones((self.n_eval_rollout_threads, self.num_agents, 1), dtype=np.float32)
+        eval_rnn_states = np.zeros((self.n_eval_rollout_threads, self.num_agents, *self.policy.actor.state_shape),
+                                   dtype=np.float32)
 
         self.timestamp = 0 # use for tacview real time render 
         if self.render_mode == "real_time" and self.tacview: #reconnect tacview to clear the telemetry
@@ -228,6 +267,12 @@ class JSBSimRunner(Runner):
             self.record_heading_first_target(total_num_steps, passed)
         mean_reward = float(np.concatenate(eval_episode_rewards).mean(axis=1).mean())
         eval_infos['eval_average_episode_rewards'] = mean_reward
+        if hasattr(self, "heading_metrics"):
+            history = Path(self.save_dir) / "heading-evaluation.jsonl"
+            record = {"step": int(total_num_steps), "training_seed": self.all_args.seed,
+                      **eval_infos, **self.heading_metrics}
+            with history.open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(record) + "\n")
         logging.info(" eval average episode rewards: %s", mean_reward)
         self.log_info(eval_infos, total_num_steps)
         logging.info("...End evaluation")
@@ -257,7 +302,9 @@ class JSBSimRunner(Runner):
             "error_limits_deg_m_mps": args.heading_error_limits,
             "required_pass_rate": args.heading_target_pass_rate,
             "training_seed": args.seed,
-            "policy_loss": args.policy_loss,
+            "algorithm_name": self.algorithm_name,
+            "memory_encoder": self.policy.actor.memory_encoder,
+            "policy_loss": args.policy_loss if self.algorithm_name == "ppo" else None,
         }
         if hasattr(args, "heading_eval_noise_std_m_deg_mps"):
             record["eval_measurement_noise_std_m_deg_mps"] = args.heading_eval_noise_std_m_deg_mps

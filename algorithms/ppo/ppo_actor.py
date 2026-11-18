@@ -3,6 +3,7 @@ import torch.nn as nn
 
 from ..utils.mlp import MLPBase
 from ..utils.gru import GRULayer
+from ..utils.lstm import LSTMLayer
 from ..utils.temporal_attention import (
     GatedAttentionGRU,
     TemporalAttention,
@@ -23,7 +24,7 @@ class PPOActor(nn.Module):
         self.activation_id = args.activation_id
         self.use_feature_normalization = args.use_feature_normalization
         self.memory_encoder = get_memory_encoder(args)
-        self.use_recurrent_policy = self.memory_encoder == "gru"
+        self.use_recurrent_policy = self.memory_encoder in {"gru", "lstm"}
         self.state_shape = get_policy_state_shape(args, obs_space)
         self.recurrent_hidden_size = args.recurrent_hidden_size
         self.recurrent_hidden_layers = args.recurrent_hidden_layers
@@ -37,9 +38,10 @@ class PPOActor(nn.Module):
         else:
             self.base = MLPBase(obs_space, self.hidden_size, self.activation_id, self.use_feature_normalization)
         input_size = self.base.output_size
-        # (2) rnn module 可选的GRU网络，把高维特征转化为低维特征
-        if self.use_recurrent_policy: # use_recurrent_policy 默认为True
-            self.rnn = GRULayer(input_size, self.recurrent_hidden_size, self.recurrent_hidden_layers)
+        # (2) 可选的递归层，根据历史特征更新记忆。
+        if self.use_recurrent_policy:
+            recurrent_layer = LSTMLayer if self.memory_encoder == "lstm" else GRULayer
+            self.rnn = recurrent_layer(input_size, self.recurrent_hidden_size, self.recurrent_hidden_layers)
             input_size = self.rnn.output_size
         # (3) act module 动作输出层，根据特征输出动作分布
         self.act = ACTLayer(act_space, input_size, self.act_hidden_size, self.activation_id, self.gain)
@@ -68,9 +70,8 @@ class PPOActor(nn.Module):
         else:
             actor_features = self.base(obs)
 
-        if self.use_recurrent_policy: # 然后经过GRU层（可选）
+        if self.use_recurrent_policy:
             actor_features, rnn_states = self.rnn(actor_features, rnn_states, masks)
-            #print("GRU OK")
         if self.use_prior: # 最后通过动作输出层
             actions, action_log_probs = self.act(actor_features, deterministic=True, alpha0=alpha0, beta0=beta0)
         else:
