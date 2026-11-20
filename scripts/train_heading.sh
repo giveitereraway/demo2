@@ -5,8 +5,14 @@
 # SPO（单帧 MLP）：sh scripts/train_heading.sh spo mlp
 # SPO + GRU：sh scripts/train_heading.sh spo gru
 # SPO + 注意力：sh scripts/train_heading.sh spo temporal_attention
-# 带噪训练：sh scripts/train_heading.sh clip gru noisy
-# 带噪训练：sh scripts/train_heading.sh clip temporal_attention noisy
+
+# 带噪训练（在仓库根目录执行）
+# 纯 PPO（单帧 MLP）：sh scripts/train_heading.sh clip mlp noisy
+# PPO + GRU：sh scripts/train_heading.sh clip gru noisy
+# PPO + 注意力：sh scripts/train_heading.sh clip temporal_attention noisy
+# SPO（单帧 MLP）：sh scripts/train_heading.sh spo mlp noisy
+# SPO + GRU：sh scripts/train_heading.sh spo gru noisy
+# SPO + 注意力：sh scripts/train_heading.sh spo temporal_attention noisy
 
 cd "$(dirname "$0")" || exit 1
 

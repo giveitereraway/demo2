@@ -12,6 +12,7 @@ from config import get_config
 from runner.experiment_tracking import create_run_dir, track_swanlab
 from runner.share_jsbsim_runner import ShareJSBSimRunner
 from envs.JSBSim.envs import SingleCombatEnv, SingleControlEnv, MultipleCombatEnv
+from envs.JSBSim.envs.selfplay_score_env import SelfplayScoreEnv
 from envs.JSBSim.envs.singlecontrol_env import (
     HEADING_MEASUREMENT_NOISE_PROBABILITIES,
     HEADING_MEASUREMENT_NOISE_STD,
@@ -28,7 +29,8 @@ def make_train_env(all_args):
     def get_env_fn(rank):
         def init_env():
             if all_args.env_name == "SingleCombat":
-                env = SingleCombatEnv(all_args.scenario_name)
+                env_type = SelfplayScoreEnv if getattr(all_args, "selfplay_algorithm", None) == "mix_pfsp" else SingleCombatEnv
+                env = env_type(all_args.scenario_name)
             elif all_args.env_name == "SingleControl":
                 env_type = HeadingMeasurementNoiseEnv if all_args.heading_measurement_noise else SingleControlEnv
                 env = env_type(all_args.scenario_name)
@@ -55,7 +57,8 @@ def make_eval_env(all_args):
     def get_env_fn(rank):
         def init_env():
             if all_args.env_name == "SingleCombat":
-                env = SingleCombatEnv(all_args.scenario_name)
+                env_type = SelfplayScoreEnv if getattr(all_args, "selfplay_algorithm", None) == "mix_pfsp" else SingleCombatEnv
+                env = env_type(all_args.scenario_name)
             elif all_args.env_name == "SingleControl":
                 noise_level = HEADING_EVAL_NOISE_LEVEL if all_args.heading_measurement_noise else 0
                 if all_args.heading_first_target:
@@ -93,6 +96,15 @@ def parse_args(args, parser):
     group.add_argument("--heading-measurement-noise", action="store_true",
                        help="Heading 训练采样随机加测量噪声，定期评估固定使用第二档噪声")
     all_args = parser.parse_known_args(args)[0]
+    if all_args.selfplay_algorithm == "mix_pfsp":
+        if (not all_args.use_selfplay or all_args.env_name != "SingleCombat"
+                or all_args.algorithm_name != "ppo" or all_args.scenario_name not in {
+                    "1v1/NoWeapon/Selfplay", "1v1/NoWeapon/TacticalHierarchySelfplay"}):
+            parser.error("mix_pfsp 需要 SingleCombat / PPO 自博弈和 Selfplay 或 TacticalHierarchySelfplay 场景")
+        if not 1 <= all_args.n_choose_opponents <= all_args.n_rollout_threads:
+            parser.error("Mix-PFSP 对手数须在 1 到训练环境数之间")
+        if min(all_args.eval_interval, all_args.save_interval) < 1:
+            parser.error("Mix-PFSP 调度间隔和保存间隔须为正数")
     if all_args.heading_measurement_noise and (
         (all_args.env_name, all_args.scenario_name, all_args.algorithm_name) != ("SingleControl", "1/heading", "ppo")
         or all_args.use_selfplay

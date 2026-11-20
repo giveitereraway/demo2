@@ -5,48 +5,58 @@
 # SPO（单帧 MLP）：sh train_selfplay.sh spo-mlp
 # SPO + GRU：sh train_selfplay.sh spo-gru
 # SPO + 注意力：	sh train_selfplay.sh spo-attention
+#
+# --selfplay-algorithm 默认 fsp，可选 sp（最新快照）、fsp（均匀抽样）、
+# pfsp（按 Elo 加权抽样）、mix_pfsp（按近期表现混合抽样）。
+# 示例：sh train_selfplay.sh ppo-gru --selfplay-algorithm mix_pfsp
 
 env="SingleCombat"
 scenario="1v1/NoWeapon/Selfplay"
 algo="ppo"
 seed=1
 
-case "${1:-ppo-attention}" in
+# 首个可选位置参数选择网络，其余参数追加到训练命令末尾。
+variant="ppo-attention"
+if [ "$#" -gt 0 ] && [ "${1#--}" = "$1" ]; then
+    variant="$1"
+    shift
+fi
+case "$variant" in
     ppo-mlp)
         policy_loss="clip"
         exp="1v1_ppo_mlp_d128_2e8"
-        set -- --memory-encoder mlp --hidden-size "128 128"
+        set -- --memory-encoder mlp --hidden-size "128 128" "$@"
         ;;
     ppo-gru)
         policy_loss="clip"
         exp="1v1_ppo_gru_d128_2e8"
         set -- --memory-encoder gru \
             --recurrent-hidden-size 128 --recurrent-hidden-layers 1 \
-            --data-chunk-length 10
+            --data-chunk-length 10 "$@"
         ;;
     ppo-attention)
         policy_loss="clip"
         exp="1v1_ppo_attention_h16_d128_2e8"
         set -- --memory-encoder temporal_attention \
-            --history-length 16 --attention-hidden-size 128 --attention-heads 4
+            --history-length 16 --attention-hidden-size 128 --attention-heads 4 "$@"
         ;;
     spo-mlp)
         policy_loss="spo"
         exp="1v1_spo_mlp_d128_2e8"
-        set -- --memory-encoder mlp --hidden-size "128 128"
+        set -- --memory-encoder mlp --hidden-size "128 128" "$@"
         ;;
     spo-gru)
         policy_loss="spo"
         exp="1v1_spo_gru_d128_2e8"
         set -- --memory-encoder gru \
             --recurrent-hidden-size 128 --recurrent-hidden-layers 1 \
-            --data-chunk-length 10
+            --data-chunk-length 10 "$@"
         ;;
     spo-attention)
         policy_loss="spo"
         exp="1v1_spo_attention_h16_d128_2e8"
         set -- --memory-encoder temporal_attention \
-            --history-length 16 --attention-hidden-size 128 --attention-heads 4
+            --history-length 16 --attention-hidden-size 128 --attention-heads 4 "$@"
         ;;
     *)
         echo "用法：$0 {ppo-mlp|ppo-gru|ppo-attention|spo-mlp|spo-gru|spo-attention}" >&2
@@ -59,12 +69,12 @@ echo "env=${env}, scenario=${scenario}, algo=${algo}, policy_loss=${policy_loss}
 CUDA_VISIBLE_DEVICES=0 python train/train_jsbsim.py \
     --env-name "$env" --algorithm-name "$algo" --scenario-name "$scenario" --experiment-name "$exp" \
     --seed "$seed" --n-training-threads 1 --n-rollout-threads 32 --cuda \
-    --log-interval 1 --save-interval 1 \
+    --log-interval 1 --save-interval 10 \
     --use-selfplay --selfplay-algorithm fsp --n-choose-opponents 1 \
-    --use-eval --n-eval-rollout-threads 1 --eval-interval 10 --eval-episodes 10 \
+    --use-eval --n-eval-rollout-threads 8 --eval-interval 10 --eval-episodes 32 \
     --num-mini-batch 5 --buffer-size 3000 --num-env-steps 2e8 \
     --policy-loss "$policy_loss" \
     --lr 3e-4 --gamma 0.99 --ppo-epoch 4 --clip-param 0.2 --max-grad-norm 2 --entropy-coef 1e-3 \
-    "$@" \
     --act-hidden-size "128 128" \
-    --user-name "sf"
+    --user-name "sf" \
+    "$@"

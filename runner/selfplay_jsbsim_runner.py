@@ -1,6 +1,7 @@
 import torch
 import logging
 import json
+import shutil
 from pathlib import Path
 import numpy as np
 from typing import List
@@ -46,6 +47,18 @@ class SelfplayJSBSimRunner(JSBSimRunner):
         # [Selfplay] allocate memory for opponent policy/data in training
         from algorithms.utils.selfplay import get_algorithm
         self.selfplay_algo = get_algorithm(self.all_args.selfplay_algorithm)
+        self.mix_pfsp = self.all_args.selfplay_algorithm == "mix_pfsp"
+        if self.mix_pfsp:
+            args = self.all_args
+            self.selfplay_algo = self.selfplay_algo(args.seed)
+            self.mix_version = 0
+            self.mix_next_id = 0
+            self.mix_eval_rng = np.random.default_rng(args.seed + 1)
+            from envs.JSBSim.utils.utils import parse_config
+            scene = parse_config(args.scenario_name)
+            self.mix_protocol = {"scenario": args.scenario_name,
+                                 "use_artillery": getattr(scene, "use_artillery", False),
+                                 "score_version": 1}
 
         assert self.num_opponents <= self.n_rollout_threads, \
             "Number of different opponents({}) must less than or equal to number of training threads({})!" \
@@ -66,9 +79,15 @@ class SelfplayJSBSimRunner(JSBSimRunner):
                         .format(self.all_args.selfplay_algorithm, self.num_opponents))
 
         if self.model_dir is not None:
-            self.restore()
+            if not self.mix_pfsp or not self.restore_mix_state():
+                self.restore()
 
     def warmup(self):
+        if self.mix_pfsp:
+            if not self.policy_pool:
+                self.save(-1)
+            self.reset_opponent()
+            return
         # reset env
         obs = self.envs.reset()
         # [Selfplay] divide ego/opponent of initial obs
@@ -135,12 +154,19 @@ class SelfplayJSBSimRunner(JSBSimRunner):
         self.policy.prep_rollout()
         total_episodes = 0
         episode_rewards, opponent_episode_rewards = [], []
+        episode_scores = []
         cumulative_rewards = np.zeros((self.n_eval_rollout_threads, *self.buffer.rewards.shape[2:]), dtype=np.float32)
         opponent_cumulative_rewards= np.zeros_like(cumulative_rewards)
 
         # [Selfplay] Choose opponent policy for evaluation
-        eval_choose_opponents = [self.selfplay_algo.choose(self.policy_pool) for _ in range(self.num_opponents)]
-        eval_each_episodes = self.eval_episodes // self.num_opponents
+        if self.mix_pfsp:
+            ids, probabilities = self.selfplay_algo.probabilities(self.policy_pool, self.mix_version)
+            eval_choose_opponents = self.mix_eval_rng.choice(ids, size=self.num_opponents, p=probabilities).tolist()
+        else:
+            eval_choose_opponents = [self.selfplay_algo.choose(self.policy_pool) for _ in range(self.num_opponents)]
+        quotas = np.full(self.num_opponents, self.eval_episodes // self.num_opponents)
+        quotas[:self.eval_episodes % self.num_opponents] += 1
+        boundaries = np.concatenate(([0], np.cumsum(quotas)))
         logging.info(f" Choose opponents {eval_choose_opponents} for evaluation")
 
         eval_cur_opponent_idx = 0
@@ -149,15 +175,18 @@ class SelfplayJSBSimRunner(JSBSimRunner):
         while total_episodes < self.eval_episodes:
 
             # [Selfplay] Load opponent policy
-            if total_episodes >= eval_cur_opponent_idx * eval_each_episodes:
+            if total_episodes == boundaries[eval_cur_opponent_idx]:
                 policy_idx = eval_choose_opponents[eval_cur_opponent_idx]
-                self.eval_opponent_policy.actor.load_state_dict(torch.load(str(self.save_dir) + f'/actor_{policy_idx}.pt', weights_only=True))
+                self.eval_opponent_policy.actor.load_state_dict(torch.load(
+                    Path(self.save_dir) / f"actor_{policy_idx}.pt", map_location=self.device, weights_only=True))
                 self.eval_opponent_policy.prep_rollout()
                 eval_cur_opponent_idx += 1
                 logging.info(f" Load opponent {policy_idx} for evaluation ({total_episodes + 1}/{self.eval_episodes})")
 
                 # reset obs/rnn/mask
                 obs = self.eval_envs.reset()
+                cumulative_rewards.fill(0)
+                opponent_cumulative_rewards.fill(0)
                 masks = np.ones((self.n_eval_rollout_threads, *self.buffer.masks.shape[2:]), dtype=np.float32)
                 rnn_states = np.zeros((self.n_eval_rollout_threads, *self.buffer.rnn_states_actor.shape[2:]), dtype=np.float32)
                 opponent_obs = obs[:, self.num_agents // 2:, ...]
@@ -183,7 +212,12 @@ class SelfplayJSBSimRunner(JSBSimRunner):
             # Obser reward and next obs
             obs, eval_rewards, dones, eval_infos = self.eval_envs.step(actions)
             dones_env = np.all(dones.squeeze(axis=-1), axis=-1)
-            total_episodes += np.sum(dones_env)
+            # 同一步可能结束多局，只接收当前对手配额内的结果。
+            remaining = boundaries[eval_cur_opponent_idx] - total_episodes
+            counted = np.flatnonzero(dones_env)[:remaining]
+            total_episodes += len(counted)
+            if self.mix_pfsp:
+                episode_scores.extend(eval_infos[index]["selfplay_result"]["score"] for index in counted)
 
             # [Selfplay] Reset obs, masks, rnn_states
             opponent_obs = obs[:, self.num_agents // 2:, ...]
@@ -202,12 +236,12 @@ class SelfplayJSBSimRunner(JSBSimRunner):
             # [Selfplay] Get rewards
             opponent_rewards = eval_rewards[:, self.num_agents//2:, ...]
             opponent_cumulative_rewards += opponent_rewards
-            opponent_episode_rewards.append(opponent_cumulative_rewards[dones_env == True])
+            opponent_episode_rewards.append(opponent_cumulative_rewards[counted])
             opponent_cumulative_rewards[dones_env == True] = 0
 
             eval_rewards = eval_rewards[:, :self.num_agents // 2, ...]
             cumulative_rewards += eval_rewards
-            episode_rewards.append(cumulative_rewards[dones_env == True])
+            episode_rewards.append(cumulative_rewards[counted])
             cumulative_rewards[dones_env == True] = 0
             
             # Tacview real time render
@@ -226,11 +260,12 @@ class SelfplayJSBSimRunner(JSBSimRunner):
         # Compute average episode rewards
         episode_rewards = np.concatenate(episode_rewards) # shape (self.eval_episodes, self.num_agents, 1)
         episode_rewards = episode_rewards.squeeze(-1).mean(axis=-1) # shape: (self.eval_episodes,)
-        eval_average_episode_rewards = np.array(np.split(episode_rewards, self.num_opponents)).mean(axis=-1) # shape (self.num_opponents,)
+        eval_average_episode_rewards = np.array([block.mean() for block in np.split(episode_rewards, boundaries[1:-1])])
 
         opponent_episode_rewards = np.concatenate(opponent_episode_rewards)
         opponent_episode_rewards = opponent_episode_rewards.squeeze(-1).mean(axis=-1)
-        opponent_average_episode_rewards = np.array(np.split(opponent_episode_rewards, self.num_opponents)).mean(axis=-1)
+        opponent_average_episode_rewards = np.array([
+            block.mean() for block in np.split(opponent_episode_rewards, boundaries[1:-1])])
 
         # Update elo
         '''
@@ -254,18 +289,18 @@ class SelfplayJSBSimRunner(JSBSimRunner):
         expected_score = 1 / (1 + 10 ** ((opponent_elo - ego_elo) / 400)) # 期望得分
 
         # 计算实际得分
-        actual_score = np.zeros_like(expected_score)
-        diff = eval_average_episode_rewards - opponent_average_episode_rewards
-        actual_score[diff > 100] = 1 # win
-        actual_score[abs(diff) < 100] = 0.5 # tie
-        actual_score[diff < -100] = 0 # lose
+        if self.mix_pfsp:
+            actual_score = np.array([block.mean() for block in np.split(episode_scores, boundaries[1:-1])])
+        else:
+            diff = eval_average_episode_rewards - opponent_average_episode_rewards
+            actual_score = np.where(diff > 100, 1.0, np.where(abs(diff) < 100, 0.5, 0.0))
 
         K = 32  # K 因子，决定 Elo 变化的幅度
         update_opponent_elo = opponent_elo + K * (expected_score - actual_score) # 更新对手的 Elo
         for i, key in enumerate(eval_choose_opponents):
-            self.policy_pool[key] = update_opponent_elo[i]
+            self.policy_pool[key] = float(update_opponent_elo[i])
         update_ego_elo = ego_elo + K * (actual_score - expected_score) # 更新当前策略的 Elo
-        self.latest_elo = update_ego_elo.mean()
+        self.latest_elo = float(update_ego_elo.mean())
 
         # Logging
         eval_infos = {}
@@ -273,6 +308,9 @@ class SelfplayJSBSimRunner(JSBSimRunner):
         eval_infos['eval_opponent_average_episode_rewards'] = opponent_average_episode_rewards.mean()
         eval_infos['eval_elo_gain'] = (K * (actual_score - expected_score)).mean()
         eval_infos['latest_elo'] = self.latest_elo
+        if self.mix_pfsp:
+            eval_infos["eval_selfplay_score"] = float(np.mean(episode_scores))
+            eval_infos["eval_episodes_completed"] = total_episodes
         logging.info(f" eval ego elo: {ego_elo.mean()} | opponent average elo: {opponent_elo.mean()}\n"
                      f" ego average episode rewards: {eval_infos['eval_average_episode_rewards']}\n"
                      f" opponent average episode rewards: {eval_infos['eval_opponent_average_episode_rewards']}\n"
@@ -281,7 +319,8 @@ class SelfplayJSBSimRunner(JSBSimRunner):
         logging.info("...End evaluation")
 
         # [Selfplay] Reset opponent for the following training
-        self.reset_opponent()
+        if not self.mix_pfsp:
+            self.reset_opponent()
         return float(eval_infos['eval_average_episode_rewards'])
 
     def update_eval_checkpoint(self, eval_reward, episode):
@@ -308,8 +347,79 @@ class SelfplayJSBSimRunner(JSBSimRunner):
         self.convergence_recorded = True
         logging.info("记录首次收敛：训练轮次 %d，步数 %d", episode + 1, self.total_num_steps)
 
+    def choose_opponent(self):
+        if getattr(self, "mix_pfsp", False):
+            return self.selfplay_algo.choose(self.policy_pool, self.mix_version)
+        return self.selfplay_algo.choose(self.policy_pool)
+
+    def record_mix_results(self, infos, dones):
+        """只用随机动作训练对局更新采样统计，保留冻结对手的身份。"""
+        finished = np.all(dones.reshape(self.n_rollout_threads, -1), axis=1)
+        for opponent_id, env_indices in zip(self.training_opponent_ids, self.opponent_env_split):
+            for env_index in env_indices[finished[env_indices]]:
+                result = infos[env_index]["selfplay_result"]
+                self.selfplay_algo.update(opponent_id, result["score"], self.mix_version)
+
+    def restore_mix_state(self):
+        path = Path(self.model_dir) / "mix_pfsp_state.pt"
+        if not path.exists():
+            logging.info("加载已有 actor/critic 开始新的 Mix-PFSP 阶段，对手统计从空池建立")
+            return False
+        state = torch.load(path, map_location=self.device, weights_only=True)
+        if state["format_version"] != 1 or state["protocol"] != self.mix_protocol:
+            raise ValueError("Mix-PFSP 恢复文件的场景或计分口径与当前配置不一致")
+        snapshot_ids = list(state["pool"])
+        for opponent_id in snapshot_ids:
+            if not opponent_id.isdecimal():
+                raise ValueError("Mix-PFSP 快照 ID 必须为非负整数")
+            source = Path(self.model_dir) / f"actor_{opponent_id}.pt"
+            if not source.is_file():
+                raise FileNotFoundError(f"恢复对手池缺少快照：{source}")
+        self.selfplay_algo.load_state_dict(state["sampler"])
+        for opponent_id in snapshot_ids:
+            source = Path(self.model_dir) / f"actor_{opponent_id}.pt"
+            target = Path(self.save_dir) / source.name
+            if source.resolve() != target.resolve():
+                if target.exists():
+                    raise FileExistsError(f"恢复目录已存在同名快照：{target}")
+                shutil.copy2(source, target)
+        self.policy.actor.load_state_dict(state["actor"])
+        self.policy.critic.load_state_dict(state["critic"])
+        self.policy_pool = state["pool"]
+        self.latest_elo = state["latest_elo"]
+        self.mix_version = state["version"]
+        self.mix_next_id = state["next_id"]
+        self.mix_eval_rng.bit_generator.state = state["eval_rng"]
+        logging.info("恢复 Mix-PFSP 对手池 %d 项及第 %d 轮统计", len(self.policy_pool), self.mix_version)
+        return True
+
     def save(self, episode):
         super().save(episode)
+        if getattr(self, "mix_pfsp", False):
+            # 单调编号保证恢复训练后继续追加不可变对手快照。
+            snapshot = Path(self.save_dir) / f"actor_{self.mix_next_id}.pt"
+            while snapshot.exists():
+                self.mix_next_id += 1
+                snapshot = Path(self.save_dir) / f"actor_{self.mix_next_id}.pt"
+            temporary = snapshot.with_suffix(".tmp")
+            torch.save(self.policy.actor.state_dict(), temporary)
+            temporary.replace(snapshot)
+            self.policy_pool[str(self.mix_next_id)] = self.latest_elo
+            self.mix_next_id += 1
+            state = {
+                "format_version": 1, "protocol": self.mix_protocol,
+                "actor": self.policy.actor.state_dict(), "critic": self.policy.critic.state_dict(),
+                "pool": self.policy_pool, "sampler": self.selfplay_algo.state_dict(),
+                "version": self.mix_version, "next_id": self.mix_next_id,
+                "latest_elo": self.latest_elo,
+                "eval_rng": self.mix_eval_rng.bit_generator.state,
+            }
+            # 同一原子文件保存学习者权重和采样统计，避免半写入后恢复错配。
+            path = Path(self.save_dir) / "mix_pfsp_state.pt"
+            temporary = path.with_suffix(".tmp")
+            torch.save(state, temporary)
+            temporary.replace(path)
+            return
         policy_actor_state_dict = self.policy.actor.state_dict()
         # [Selfplay] save policy & performance
         torch.save(policy_actor_state_dict, str(self.save_dir) + f'/actor_{episode}.pt')
@@ -318,11 +428,12 @@ class SelfplayJSBSimRunner(JSBSimRunner):
     def reset_opponent(self):
         choose_opponents = []
         for policy in self.opponent_policy:
-            choose_idx = self.selfplay_algo.choose(self.policy_pool)
+            choose_idx = self.choose_opponent()
             choose_opponents.append(choose_idx)
             policy.actor.load_state_dict(torch.load(str(self.save_dir) + f'/actor_{choose_idx}.pt', weights_only=True))
             policy.prep_rollout()
         logging.info(f" Choose opponents {choose_opponents} for training")
+        self.training_opponent_ids = choose_opponents
 
         # clear buffer
         self.buffer.clear()

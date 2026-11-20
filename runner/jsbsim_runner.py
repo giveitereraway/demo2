@@ -37,6 +37,7 @@ class JSBSimRunner(Runner):
 
     def run(self):
         self.warmup() # warmup() 为后续的 collect() 和 insert() 方法提供基础：collect() 方法会使用 self.buffer.obs[step] 来获取当前观测；insert() 方法会向缓冲区添加新的经验数据
+        mix_pfsp = getattr(self, "mix_pfsp", False)
 
         start = time.time()
         self.total_num_steps = 0
@@ -54,6 +55,8 @@ class JSBSimRunner(Runner):
 
                 # Obser reward and next obs 获取新观测和奖励
                 obs, rewards, dones, infos = self.envs.step(actions)
+                if mix_pfsp:
+                    self.record_mix_results(infos, dones)
 
                 # Extra recorded information
                 for info in infos:
@@ -71,6 +74,8 @@ class JSBSimRunner(Runner):
 
             # post process
             self.total_num_steps = (episode + 1) * self.buffer_size * self.n_rollout_threads
+            if mix_pfsp:
+                self.mix_version += 1
 
             # log information
             if episode % self.log_interval == 0:
@@ -94,7 +99,7 @@ class JSBSimRunner(Runner):
                 self.log_info(train_infos, self.total_num_steps)
 
             # eval
-            eval_update = episode + 1 if getattr(self.all_args, "heading_first_target", False) else episode
+            eval_update = episode + 1 if mix_pfsp or getattr(self.all_args, "heading_first_target", False) else episode
             if self.use_eval and ((eval_update % self.eval_interval == 0 and eval_update != 0)
                                   or episode == episodes - 1):
                 # 短训练也评估最后模型；自博弈首次评估前需有可加载的对手快照。
@@ -106,6 +111,8 @@ class JSBSimRunner(Runner):
             # save model
             if (episode % self.save_interval == 0) or (episode == episodes - 1):
                 self.save(episode)
+            if mix_pfsp and eval_update % self.eval_interval == 0 and episode < episodes - 1:
+                self.reset_opponent()
 
     def warmup(self):
         # reset env
