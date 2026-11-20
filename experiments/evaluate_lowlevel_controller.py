@@ -24,7 +24,7 @@ import math
 import random
 import sys
 from collections import defaultdict
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -662,6 +662,7 @@ def run_trial(
     device: torch.device,
     *,
     condition: ObservationCondition | None = None,
+    on_snapshot: Callable[[SingleControlEnv, dict[str, Any] | None], None] | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
     set_random_seed(seed)
     env.seed(seed)
@@ -683,6 +684,9 @@ def run_trial(
     controls: list[np.ndarray] = []
     done = False
 
+    if on_snapshot is not None:
+        # None 表示首个动作执行前的初始位姿。
+        on_snapshot(env, None)
     for step_idx in range(horizon_steps):
         if step_idx == stage.end_step:
             stage = next(schedule)
@@ -731,6 +735,8 @@ def run_trial(
                 "target_speed_mps": target_info["target_speed_mps"],
             })
         records.append(record)
+        if on_snapshot is not None:
+            on_snapshot(env, record)
         if done:
             break
 
