@@ -1,5 +1,7 @@
 #!/usr/bin/env python
-"""用单条阶跃指令或固定指令序列评估 heading 策略的观测退化鲁棒性。
+"""用训练式随机指令序列或固定指令序列评估 heading 策略的观测退化鲁棒性。
+
+默认每个种子评估一局，每 30 秒换一次目标，最多飞行 6 段共 180 秒。
 
 传入一个或多个 actor 权重文件，也可传入包含 actor_latest.pt 的单次训练目录。
 MLP 和注意力权重需要同目录的 model_config.json。PPO/SPO 标签由模型参数指定，
@@ -11,9 +13,9 @@ from __future__ import annotations
 import argparse
 import math
 import sys
-from collections import deque
+from collections.abc import Iterator
 from contextlib import ExitStack
-from dataclasses import asdict, dataclass
+from dataclasses import asdict
 from datetime import datetime
 from itertools import cycle
 from pathlib import Path
@@ -27,86 +29,26 @@ if str(REPO_ROOT) not in sys.path:
 
 from experiments import evaluate_lowlevel_controller as heading
 from experiments.partial_observability_gru_eval import save_csv, save_json
-from envs.JSBSim.envs.singlecontrol_env import HEADING_MEASUREMENT_NOISE_STD, HeadingMeasurementNoiseEnv
+from envs.JSBSim.core.catalog import Catalog as c
+from envs.JSBSim.envs.singlecontrol_env import (
+    HEADING_MEASUREMENT_NOISE_STD,
+    HeadingErrorChannelDegrader,
+    HeadingMeasurementNoiseEnv,
+)
+from envs.JSBSim.termination_conditions import UnreachHeading
 
 
-MODEL_ENCODERS = {
-    "ppo-gru": "gru",
-    "ppo-igru": "igru",
-    "ppo-gru-attention": "gru_attention",
-    "ppo-attention": "temporal_attention",
-    "ppo-mlp": "mlp",
-    "spo-gru": "gru",
-    "spo-igru": "igru",
-    "spo-gru-attention": "gru_attention",
-    "spo-attention": "temporal_attention",
-    "spo-mlp": "mlp",
-}
+MODEL_ENCODERS = heading.MODEL_ENCODERS
+load_actor = heading.load_named_actor
 OUTPUT_ROOT = REPO_ROOT / "experiments" / "results" / "chapter_3" /"observation_degradation" / "heading_observation_degradation"
-SENSOR_SEED = 31001
-HORIZON_SEC = 30.0
-ERROR_SLICE = slice(0, 3)
-
-
-@dataclass(frozen=True)
-class Degradation:
-    dropout_probability: float
-    delay_steps: int
-    altitude_noise_std_m: float
-    heading_noise_std_deg: float
-    speed_noise_std_mps: float
-
-
-@dataclass(frozen=True)
-class Condition:
-    name: str
-    degradation: Degradation | None = None
-
-
-# 噪声标准差按高度、航向、速度的物理单位给出。丢帧和延迟作用于整个误差向量。
-# (丢帧率、时延、高度、航向、速度误差)
-CONDITIONS = (
-    Condition("E0"),
-    Condition("E1", Degradation(0.10, 1, 10.0, 1.0, 1.0)),
-    Condition("E2", Degradation(0.20, 2, 25.0, 3.0, 3.0)),
-    Condition("E3", Degradation(0.30, 3, 50.0, 5.0, 5.0)),
-    Condition("E4", Degradation(0.40, 4, 75.0, 7.0, 7.0)),
-    Condition("E5", Degradation(0.50, 5, 100.0, 9.0, 9.0)),
-    Condition("E6", Degradation(0.60, 6, 125.0, 11.0, 11.0)),
-)
+SENSOR_SEED = heading.SENSOR_SEED
+TRAINING_STAGE_SEC = 30.0
+TRAINING_STAGE_COUNT = 6
+CONDITIONS = heading.OBSERVATION_DEGRADATION_CONDITIONS
 MEASUREMENT_NOISE_CONDITIONS = (
-    Condition("E0"),
-    *(Condition(f"N{level}") for level in range(1, len(HEADING_MEASUREMENT_NOISE_STD))),
+    heading.ObservationCondition("E0"),
+    *(heading.ObservationCondition(f"N{level}") for level in range(1, len(HEADING_MEASUREMENT_NOISE_STD))),
 )
-
-
-class TrackingErrorDegrader:
-    """仅退化 heading 观测的前三维，保留实时本机状态。"""
-
-    def __init__(self, config: Degradation, initial_obs: np.ndarray, rng: np.random.Generator):
-        self.rng = rng
-        self.dropout_probability = config.dropout_probability
-        self.noise_std = np.array([
-            config.altitude_noise_std_m / 1000.0,
-            np.deg2rad(config.heading_noise_std_deg),
-            config.speed_noise_std_mps / 340.0,
-        ])
-        # 和原实验一致，用回合首帧填充延迟队列。
-        self.last_valid = initial_obs[ERROR_SLICE].copy()
-        self.delay = deque([self.last_valid] * config.delay_steps)
-        self.dropped_frames = 0
-
-    def transform(self, obs: np.ndarray) -> np.ndarray:
-        measured = obs[ERROR_SLICE] + self.rng.standard_normal(3) * self.noise_std
-        measured[1] = (measured[1] + np.pi) % (2 * np.pi) - np.pi
-        if self.rng.random() < self.dropout_probability:
-            self.dropped_frames += 1
-        else:
-            self.last_valid = np.clip(measured, -10.0, 10.0)
-        self.delay.append(self.last_valid)
-        degraded = obs.copy()
-        degraded[ERROR_SLICE] = self.delay.popleft()
-        return degraded
 
 
 def parse_args() -> argparse.Namespace:
@@ -121,7 +63,7 @@ def parse_args() -> argparse.Namespace:
                         help="改为评估干净观测和三个测量噪声档位，默认评估 E0–E6 误差通道退化")
     parser.add_argument("--prefer-best", action="store_true",
                         help="当传入训练目录且存在 actor_best.pt 时优先加载 actor_best.pt")
-    parser.add_argument("--quick", action="store_true", help="用 1 个种子评估，单指令模式评估 3 条指令")
+    parser.add_argument("--quick", action="store_true", help="每个模型和退化档位只用 1 个种子评估")
     parser.add_argument("--no-plots", action="store_true", help="仅输出表格和配置")
     args = parser.parse_args()
     args.models = {
@@ -135,37 +77,39 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def load_actor(path: Path, encoder: str, device: torch.device, *, prefer_best: bool = False) -> tuple[Path, heading.PPOActor]:
-    path = path.resolve()
-    if path.is_dir():
-        best_candidate = path / "actor_best.pt"
-        path = best_candidate if (prefer_best and best_candidate.is_file()) else (path / "actor_latest.pt")
-    if not path.is_file():
-        raise FileNotFoundError(f"权重文件不存在：{path}")
-    if encoder != "gru" and not path.with_name("model_config.json").is_file():
-        raise FileNotFoundError(f"{encoder} 权重缺少同目录的 model_config.json：{path}")
-    actor = heading.build_actor(path, device)
-    if actor.memory_encoder != encoder:
-        raise ValueError(f"模型 {path} 的编码器为 {actor.memory_encoder}，期望 {encoder}")
-    if actor.use_prior:
-        raise ValueError(f"heading 模型必须关闭导弹发射先验：{path}")
-    return path, actor
+def iter_training_stages(env: heading.SingleControlEnv, horizon_steps: int) -> Iterator[heading.CommandStage]:
+    stage_steps = horizon_steps // TRAINING_STAGE_COUNT
+    condition = next(cond for cond in env.task.termination_conditions if isinstance(cond, UnreachHeading))
+    # 评估按控制步换目标并记录上一段的末步误差，暂停环境内部自行换目标。
+    env.agents[heading.AGENT_ID].set_property_value(c.heading_check_time, heading.FIXED_HEADING_CHECK_TIME_SEC)
+    for idx in range(TRAINING_STAGE_COUNT):
+        delta_heading, delta_altitude_ft, delta_speed = condition.advance_target(env, heading.AGENT_ID)
+        command = heading.Command(delta_altitude_ft * heading.FT_TO_M, delta_heading, delta_speed)
+        yield heading.CommandStage(
+            f"training_target_{idx + 1}", command, heading.read_command_target(env),
+            idx * stage_steps, (idx + 1) * stage_steps,
+        )
 
 
 @torch.inference_mode()
 def run_trial(
     env: heading.SingleControlEnv,
     actor: heading.PPOActor,
-    condition: Condition,
+    condition: heading.ObservationCondition,
     trial_id: int,
     seed: int,
     command: heading.Command | None,
     horizon_steps: int,
     device: torch.device,
+    *,
+    training_sequence: bool = False,
 ) -> tuple[dict, list[dict]]:
     env.seed(seed)
     env.reset()
-    schedule = heading.iter_command_stages(env, command, horizon_steps)
+    schedule = (
+        iter_training_stages(env, horizon_steps) if training_sequence
+        else heading.iter_command_stages(env, command, horizon_steps)
+    )
     stage = next(schedule)
     stages = [stage]
     obs = env.get_obs()[heading.AGENT_ID].astype(np.float32)
@@ -173,7 +117,7 @@ def run_trial(
     if condition.degradation is not None:
         # 同一试验跨模型和退化档位复用随机数流，并独立于上一回合长度。
         rng = np.random.default_rng([SENSOR_SEED, trial_id])
-        degrader = TrackingErrorDegrader(condition.degradation, obs, rng)
+        degrader = HeadingErrorChannelDegrader(condition.degradation, obs, rng)
 
     state = torch.zeros((1, *actor.state_shape), device=device)
     masks = torch.ones((1, 1), device=device)
@@ -182,6 +126,7 @@ def run_trial(
     records = []
     controls = []
     done = False
+    heading_check_failed = False
     for step in range(horizon_steps):
         if step == stage.end_step:
             stage = next(schedule)
@@ -201,11 +146,21 @@ def run_trial(
         done = bool(dones.item())
         if done:
             break
+        if (
+            training_sequence and step + 1 == stage.end_step
+            and abs(records[-1]["heading_error_deg"]) > heading.SUCCESS_HEADING_DEG
+        ):
+            heading_check_failed = True
+            done = step + 1 < horizon_steps
+            break
 
     row, stage_rows = heading.summarize_trial(
-        trial_id, seed, stages, records, controls, done, env.time_interval
+        trial_id, seed, stages, records, controls, done, env.time_interval,
+        expected_stage_count=TRAINING_STAGE_COUNT if training_sequence else len(heading.FIXED_SEQUENCE),
     )
     row["success"] = row["success"] and len(records) == horizon_steps
+    if heading_check_failed:
+        row["termination_reason"] = stage_rows[-1]["termination_reason"] = "unreach_heading"
     row["episode_reward"] = episode_reward
     row["actual_dropout_rate"] = degrader.dropped_frames / len(records) if degrader else 0.0
     if gate_values:
@@ -310,8 +265,6 @@ def main() -> None:
         for name, path in args.models.items()
     }
     seeds = heading.SEEDS[:1 if args.quick else args.num_seeds]
-    commands = [None] if args.fixed_sequence else heading.build_commands(quick=args.quick)
-    trials = [(seed, command) for seed in seeds for command in commands]
     conditions = MEASUREMENT_NOISE_CONDITIONS if args.measurement_noise else CONDITIONS
     output_dir = args.output_dir.resolve() / datetime.now().strftime("run_%Y%m%d_%H%M%S_%f")
     summaries = []
@@ -324,10 +277,13 @@ def main() -> None:
                 noisy_env = HeadingMeasurementNoiseEnv(heading.SCENARIO_NAME, noise_level=level, sensor_seed=SENSOR_SEED)
                 stack.callback(noisy_env.close)
                 evaluation_envs[condition.name] = noisy_env
-        horizon_steps = (
-            heading.fixed_sequence_horizon_steps(env) if args.fixed_sequence
-            else math.ceil(HORIZON_SEC / env.time_interval)
-        )
+        stage_steps = math.ceil(TRAINING_STAGE_SEC / env.time_interval)
+        if args.fixed_sequence:
+            horizon_steps = heading.fixed_sequence_horizon_steps(env)
+        else:
+            horizon_steps = TRAINING_STAGE_COUNT * stage_steps
+            if horizon_steps > env.config.max_steps:
+                raise ValueError(f"场景最多允许 {env.config.max_steps} 步，训练式序列需要 {horizon_steps} 步")
         config = {
             "scenario": heading.SCENARIO_NAME,
             "device": str(device),
@@ -342,7 +298,7 @@ def main() -> None:
             "seeds": seeds,
             "sensor_seed": SENSOR_SEED,
             "conditions": [asdict(condition) for condition in conditions],
-            "horizon_sec": horizon_steps * env.time_interval if args.fixed_sequence else HORIZON_SEC,
+            "horizon_sec": horizon_steps * env.time_interval,
             "step_sec": env.time_interval,
             "success_thresholds": {
                 "heading_deg": heading.SUCCESS_HEADING_DEG,
@@ -357,26 +313,32 @@ def main() -> None:
         if args.fixed_sequence:
             config["fixed_sequence"] = heading.fixed_sequence_config(horizon_steps, env.time_interval)
         else:
-            config["commands"] = [asdict(command) for command in commands]
+            config["training_sequence"] = {
+                "target_reference": "previous_target",
+                "stage_count": TRAINING_STAGE_COUNT,
+                "stage_duration_sec": stage_steps * env.time_interval,
+                "stage_steps": stage_steps,
+                "terminate_on_heading_miss": True,
+            }
         save_json(config, output_dir / "config.json")
         print(f"输出目录：{output_dir}", flush=True)
         for name, (_, actor) in models.items():
             baseline = {}
             for condition in conditions:
-                print(f"{name} / {condition.name}：{len(trials)} 局", flush=True)
+                print(f"{name} / {condition.name}：{len(seeds)} 局", flush=True)
                 rows = []
                 stage_rows = []
                 labels = {"model": name, "condition": condition.name}
-                for idx, (seed, command) in enumerate(trials, start=1):
+                for idx, seed in enumerate(seeds, start=1):
                     row, trial_stages = run_trial(
-                        evaluation_envs.get(condition.name, env), actor, condition, idx, seed, command, horizon_steps, device,
+                        evaluation_envs.get(condition.name, env), actor, condition, idx, seed, None, horizon_steps, device,
+                        training_sequence=not args.fixed_sequence,
                     )
                     rows.append({**labels, **row})
                     stage_rows.extend({**labels, **stage} for stage in trial_stages)
                 condition_dir = output_dir / name / condition.name
                 save_csv(rows, condition_dir / "episodes.csv")
-                if args.fixed_sequence:
-                    save_csv(stage_rows, condition_dir / "stages.csv")
+                save_csv(stage_rows, condition_dir / "stages.csv")
                 summary = heading.summarize_rows(rows)
                 for metric in ("episode_reward", "actual_dropout_rate"):
                     summary[f"{metric}_mean"] = float(np.mean([row[metric] for row in rows]))

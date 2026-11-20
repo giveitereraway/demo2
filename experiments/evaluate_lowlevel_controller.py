@@ -11,6 +11,8 @@
 3、20✖45=900个 episode, 每个episode最多跑30秒, 如果 episode 内无物理越界且末端误差满足阈值，则认为成功。
 
 使用 --fixed-sequence 时，每个种子飞行一次，连续执行 4 段各 30 秒的指令。
+使用 --observation-degradation 时，每个 E0–E6 档位复用同一批单指令试验。
+可同时传入 --ppo-gru、--ppo-igru 等权重参数，在一张图上对比各模型。
 """
 
 from __future__ import annotations
@@ -23,7 +25,10 @@ import random
 import sys
 from collections import defaultdict
 from collections.abc import Iterator
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import asdict, dataclass
+from datetime import datetime
+from itertools import repeat
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -39,6 +44,7 @@ from gymnasium import spaces
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCENARIO_NAME = "1/heading"
 OUTPUT_DIR = REPO_ROOT / "experiments" / "results" / "chapter_3"
+DEGRADATION_OUTPUT_DIR = REPO_ROOT / "outputs" / "lowlevel_observation_degradation"
 
 # 主实验指令集：对应分层高层任务常用的底层指令范围。
 COMMAND_ALTITUDE_M = [-100.0, 0.0, 100.0]
@@ -93,12 +99,57 @@ if str(REPO_ROOT) not in sys.path:
 
 from algorithms.ppo.ppo_actor import PPOActor  # noqa: E402
 from envs.JSBSim.core.catalog import Catalog as c  # noqa: E402
-from envs.JSBSim.envs.singlecontrol_env import SingleControlEnv  # noqa: E402
+from envs.JSBSim.envs.singlecontrol_env import (  # noqa: E402
+    HEADING_MIXED_DEGRADATION_SPECS,
+    HeadingDegradationSpec,
+    HeadingErrorChannelDegrader,
+    SingleControlEnv,
+)
 
 
 FT_TO_M = 0.3048
 ACTION_NAMES = ("aileron", "elevator", "rudder", "throttle")
 AGENT_ID = "A0100"
+SENSOR_SEED = 31001
+MODEL_ENCODERS = {
+    "ppo-gru": "gru",
+    "ppo-igru": "igru",
+    "ppo-gru-attention": "gru_attention",
+    "ppo-attention": "temporal_attention",
+    "ppo-mlp": "mlp",
+    "spo-gru": "gru",
+    "spo-igru": "igru",
+    "spo-gru-attention": "gru_attention",
+    "spo-attention": "temporal_attention",
+    "spo-mlp": "mlp",
+}
+
+
+@dataclass(frozen=True)
+class ObservationCondition:
+    name: str
+    degradation: HeadingDegradationSpec | None = None
+
+
+@dataclass(frozen=True)
+class EvaluationJob:
+    model_path: Path
+    output_dir: Path
+    condition: ObservationCondition | None = None
+    model_name: str | None = None
+
+
+# E0 为干净观测，E1–E3 沿用训练档位，E4–E6 评估更强的退化。
+OBSERVATION_DEGRADATION_CONDITIONS = tuple(
+    ObservationCondition(f"E{level}", spec)
+    for level, spec in enumerate((
+        None,
+        *HEADING_MIXED_DEGRADATION_SPECS[1:],
+        HeadingDegradationSpec(0.40, 4, 75.0, 7.0, 7.0),
+        HeadingDegradationSpec(0.50, 5, 100.0, 9.0, 9.0),
+        HeadingDegradationSpec(0.60, 6, 125.0, 11.0, 11.0),
+    ))
+)
 
 
 @dataclass(frozen=True)
@@ -131,13 +182,23 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="评估 MLP、GRU 或时序注意力模型对航向、高度、速度指令的跟踪效果。"
     )
-    parser.add_argument("--model-path", type=Path, required=True,
+    parser.add_argument("--model-path", type=Path,
                         help="actor 权重文件，模型配置 model_config.json 与权重放在同一目录。")
+    model_group = parser.add_argument_group("观测退化对比的模型参数")
+    for name in MODEL_ENCODERS:
+        model_group.add_argument(f"--{name}", type=Path, metavar="PATH", help="权重文件或单次训练目录。")
+    model_group.add_argument("--prefer-best", action="store_true",
+                             help="传入训练目录且存在 actor_best.pt 时优先加载该权重。")
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--scenario-name", type=str, default=SCENARIO_NAME)
     parser.add_argument("--horizon-sec", type=float, help="单指令模式的回合时长，默认 30 秒。")
     parser.add_argument("--num-seeds", type=int, default=len(SEEDS))
-    add_fixed_sequence_argument(parser)
+    mode = parser.add_mutually_exclusive_group()
+    add_fixed_sequence_argument(mode)
+    mode.add_argument("--observation-degradation", action="store_true",
+                      help="对单指令试验逐档评估 E0–E6 观测退化。")
+    parser.add_argument("--device", default=DEVICE, help="推理设备，例如 cpu 或 cuda:0。")
+    parser.add_argument("--workers", type=int, default=1, help="并行评估的进程数，仅支持 CPU。")
     parser.add_argument("--no-timeseries", action="store_true")
     parser.add_argument("--no-plots", action="store_true")
     parser.add_argument(
@@ -146,16 +207,36 @@ def parse_args() -> argparse.Namespace:
         help="只跑 1 个种子，单指令模式只评估 3 条指令。",
     )
     args = parser.parse_args()
+    args.models = {
+        name: path for name in MODEL_ENCODERS
+        if (path := getattr(args, name.replace("-", "_"))) is not None
+    }
+    if not args.models and args.model_path is None:
+        parser.error("请传入 --model-path 或至少一个有名称的模型参数（例如 --ppo-gru）")
+    if args.models and args.model_path is not None:
+        parser.error("--model-path 与 --ppo-gru 等有名称的模型参数不能同时使用")
+    if args.models and not args.observation_degradation:
+        parser.error("--ppo-gru 等模型参数需要 --observation-degradation")
+    if args.prefer_best and not args.models:
+        parser.error("--prefer-best 需要 --ppo-gru 等有名称的模型参数")
     if args.fixed_sequence and args.horizon_sec is not None:
         parser.error("--horizon-sec 仅适用于单指令模式")
+    if args.workers < 1:
+        parser.error("--workers 必须大于等于 1")
+    if args.workers > 1 and (not args.observation_degradation or args.device != "cpu"):
+        parser.error("并行评估需要 --observation-degradation --device cpu")
     if args.horizon_sec is None:
         args.horizon_sec = HORIZON_SEC
     if args.output_dir is None:
-        args.output_dir = OUTPUT_DIR / "fixed_sequence" if args.fixed_sequence else OUTPUT_DIR
+        if args.observation_degradation:
+            run_name = datetime.now().strftime("run_%Y%m%d_%H%M%S_%f")
+            args.output_dir = DEGRADATION_OUTPUT_DIR / run_name
+        else:
+            args.output_dir = OUTPUT_DIR / "fixed_sequence" if args.fixed_sequence else OUTPUT_DIR
     return args
 
 
-def add_fixed_sequence_argument(parser: argparse.ArgumentParser) -> None:
+def add_fixed_sequence_argument(parser: argparse.ArgumentParser | argparse._MutuallyExclusiveGroup) -> None:
     parser.add_argument(
         "--fixed-sequence",
         action="store_true",
@@ -227,6 +308,25 @@ def build_actor(model_path: Path, device: torch.device) -> PPOActor:
     return actor
 
 
+def load_named_actor(
+    path: Path, encoder: str, device: torch.device, *, prefer_best: bool = False,
+) -> tuple[Path, PPOActor]:
+    path = path.resolve()
+    if path.is_dir():
+        best_candidate = path / "actor_best.pt"
+        path = best_candidate if (prefer_best and best_candidate.is_file()) else path / "actor_latest.pt"
+    if not path.is_file():
+        raise FileNotFoundError(f"权重文件不存在：{path}")
+    if encoder != "gru" and not path.with_name("model_config.json").is_file():
+        raise FileNotFoundError(f"{encoder} 权重缺少同目录的 model_config.json：{path}")
+    actor = build_actor(path, device)
+    if actor.memory_encoder != encoder:
+        raise ValueError(f"模型 {path} 的编码器为 {actor.memory_encoder}，期望 {encoder}")
+    if actor.use_prior:
+        raise ValueError(f"heading 模型必须关闭导弹发射先验：{path}")
+    return path, actor
+
+
 def build_commands(quick: bool = False) -> list[Command]:
     commands = [
         Command(delta_altitude_m, delta_heading_deg, delta_velocity_mps)
@@ -252,7 +352,6 @@ def set_command_target(
 ) -> dict[str, float]:
     sim = env.agents[AGENT_ID]
     current_heading_deg = sim.get_property_value(c.attitude_psi_deg)
-    current_altitude_ft = sim.get_property_value(c.position_h_sl_ft)
     current_altitude_m = sim.get_property_value(c.position_h_sl_m)
     current_speed_mps = sim.get_property_value(c.velocities_u_mps)
 
@@ -282,18 +381,30 @@ def set_command_target(
     sim.set_property_value(c.target_velocities_u_mps, target_speed_mps)
     sim.set_property_value(c.heading_check_time, FIXED_HEADING_CHECK_TIME_SEC)
 
+    target_info = read_command_target(env)
+    if reference is None:
+        target_info["actual_delta_heading_deg"] = command.delta_heading_deg
+    return target_info
+
+
+def read_command_target(env: SingleControlEnv) -> dict[str, float]:
+    sim = env.agents[AGENT_ID]
+    current_heading_deg = sim.get_property_value(c.attitude_psi_deg)
+    current_altitude_m = sim.get_property_value(c.position_h_sl_m)
+    current_speed_mps = sim.get_property_value(c.velocities_u_mps)
+    target_heading_deg = sim.get_property_value(c.target_heading_deg)
+    target_altitude_ft = sim.get_property_value(c.target_altitude_ft)
+    target_altitude_m = target_altitude_ft * FT_TO_M
+    target_speed_mps = sim.get_property_value(c.target_velocities_u_mps)
     return {
         "initial_heading_deg": current_heading_deg,
         "initial_altitude_m": current_altitude_m,
-        "initial_altitude_ft": current_altitude_ft,
+        "initial_altitude_ft": sim.get_property_value(c.position_h_sl_ft),
         "initial_speed_mps": current_speed_mps,
         "target_heading_deg": target_heading_deg,
         "target_altitude_m": target_altitude_m,
         "target_speed_mps": target_speed_mps,
-        "actual_delta_heading_deg": (
-            (target_heading_deg - current_heading_deg + 180.0) % 360.0 - 180.0
-            if reference is not None else command.delta_heading_deg
-        ),
+        "actual_delta_heading_deg": (target_heading_deg - current_heading_deg + 180.0) % 360.0 - 180.0,
         "actual_delta_altitude_m": target_altitude_m - current_altitude_m,
         "actual_delta_velocity_mps": target_speed_mps - current_speed_mps,
     }
@@ -503,6 +614,8 @@ def summarize_trial(
     controls: list[np.ndarray],
     done: bool,
     time_interval: float,
+    *,
+    expected_stage_count: int = len(FIXED_SEQUENCE),
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     first = stages[0]
     if first.name is None:
@@ -534,10 +647,11 @@ def summarize_trial(
 
     episode = summarize_episode(trial_id, seed, None, {}, records, controls, done, time_interval)
     episode["completed_stages"] = sum(row["stage_complete"] for row in stage_rows)
-    episode["success"] = len(stage_rows) == len(FIXED_SEQUENCE) and all(row["success"] for row in stage_rows)
+    episode["success"] = len(stage_rows) == expected_stage_count and all(row["success"] for row in stage_rows)
     return episode, stage_rows
 
 
+@torch.inference_mode()
 def run_trial(
     env: SingleControlEnv,
     actor: PPOActor,
@@ -546,6 +660,8 @@ def run_trial(
     command: Command | None,
     horizon_steps: int,
     device: torch.device,
+    *,
+    condition: ObservationCondition | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
     set_random_seed(seed)
     env.seed(seed)
@@ -554,8 +670,15 @@ def run_trial(
     stage = next(schedule)
     stages = [stage]
 
-    policy_state = np.zeros((1, *actor.state_shape), dtype=np.float32)
-    masks = np.ones((1, 1), dtype=np.float32)
+    obs = env.task.get_obs(env, AGENT_ID).astype(np.float32)
+    degrader = None
+    if condition is not None and condition.degradation is not None:
+        # 同一条指令和种子的试验编号在各档位一致，复用传感器随机数流。
+        rng = np.random.default_rng([SENSOR_SEED, trial_id])
+        degrader = HeadingErrorChannelDegrader(condition.degradation, obs, rng)
+
+    policy_state = torch.zeros((1, *actor.state_shape), device=device)
+    masks = torch.ones((1, 1), device=device)
     records: list[dict[str, Any]] = []
     controls: list[np.ndarray] = []
     done = False
@@ -564,23 +687,17 @@ def run_trial(
         if step_idx == stage.end_step:
             stage = next(schedule)
             stages.append(stage)
+            obs = env.task.get_obs(env, AGENT_ID).astype(np.float32)
         target_info = stage.target_info
-        obs = env.task.get_obs(env, AGENT_ID).astype(np.float32)
-        obs = np.expand_dims(obs, axis=0)
-        with torch.no_grad():
-            action_tensor, _, next_state = actor(
-                obs,
-                policy_state,
-                masks,
-                deterministic=True,
-            )
-        action = action_tensor.detach().cpu().numpy().reshape(1, -1).astype(np.int64)
-        policy_state = next_state.detach().cpu().numpy()
+        policy_obs = degrader.transform(obs) if degrader is not None else obs
+        action_tensor, _, policy_state = actor(policy_obs[None, :], policy_state, masks, deterministic=True)
+        action = action_tensor.cpu().numpy().reshape(1, -1).astype(np.int64, copy=False)
 
         continuous_action = env.task.normalize_action(env, AGENT_ID, action[0])
         controls.append(np.asarray(continuous_action, dtype=np.float64))
 
-        _, _, dones, _ = env.step(action)
+        next_obs, _, dones, _ = env.step(action)
+        obs = next_obs[0].astype(np.float32)
         done = bool(np.asarray(dones).reshape(-1)[0])
         record = get_state_record(env)
         record.update(
@@ -620,7 +737,9 @@ def run_trial(
     episode_row, stage_rows = summarize_trial(
         trial_id, seed, stages, records, controls, done, env.time_interval
     )
-    _ = device
+    if condition is not None:
+        episode_row["success"] = episode_row["success"] and len(records) == horizon_steps
+        episode_row["actual_dropout_rate"] = degrader.dropped_frames / len(records) if degrader else 0.0
     return episode_row, records, stage_rows
 
 
@@ -821,16 +940,56 @@ def plot_timeseries(timeseries_rows: list[dict[str, Any]], output_dir: Path) -> 
     plt.close(fig)
 
 
-def run_evaluation(args: argparse.Namespace) -> None:
-    model_path = args.model_path.resolve()
-    output_dir = args.output_dir.resolve()
+def plot_degradation_summary(rows: list[dict[str, Any]], output_dir: Path) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.ticker import PercentFormatter
+
+    configure_matplotlib_chinese_font()
+    metrics = (
+        ("success_rate", "成功率"),
+        ("heading_mae_deg_mean", "航向 MAE (°)"),
+        ("altitude_mae_m_mean", "高度 MAE (m)"),
+        ("speed_mae_mps_mean", "前向速度 MAE (m/s)"),
+    )
+    rows_by_model = defaultdict(list)
+    for row in rows:
+        rows_by_model[row.get("model")].append(row)
+
+    fig, axes = plt.subplots(2, 2, figsize=(10, 6), layout="constrained")
+    for ax, (metric, label) in zip(axes.flat, metrics):
+        for index, (model_name, model_rows) in enumerate(rows_by_model.items()):
+            levels = [row["condition"] for row in model_rows]
+            ax.plot(
+                levels, [row[metric] for row in model_rows], label=model_name, marker="o",
+                linestyle="--" if index % 2 else "-", fillstyle="none" if index % 2 else "full",
+            )
+        ax.set_xlabel("观测退化档位")
+        ax.set_ylabel(label)
+        ax.grid(alpha=0.25)
+    axes[0, 0].set_ylim(-0.02, 1.02)
+    axes[0, 0].yaxis.set_major_formatter(PercentFormatter(1.0))
+    if any(name is not None for name in rows_by_model):
+        axes[0, 0].legend(loc="lower left")
+    fig.savefig(output_dir / "observation_degradation.png", dpi=180)
+    plt.close(fig)
+
+
+def run_condition(args: argparse.Namespace, job: EvaluationJob) -> dict[str, Any]:
+    model_path = job.model_path
+    output_dir = job.output_dir
+    condition = job.condition
     output_dir.mkdir(parents=True, exist_ok=True)
 
     seeds = SEEDS[: max(1, args.num_seeds)]
     if args.quick:
         seeds = seeds[:1]
     commands = [None] if args.fixed_sequence else build_commands(quick=args.quick)
-    device = torch.device(DEVICE)
+    device = torch.device(args.device)
+    if device.type == "cpu":
+        torch.set_num_threads(1)
     actor = build_actor(model_path, device)
     env = SingleControlEnv(args.scenario_name)
     total_trials = len(seeds) * len(commands)
@@ -838,6 +997,9 @@ def run_evaluation(args: argparse.Namespace) -> None:
     timeseries_rows: list[dict[str, Any]] = []
     stage_rows: list[dict[str, Any]] = []
     trial_id = 0
+    condition_label = condition.name if condition is not None else ""
+    if job.model_name is not None:
+        condition_label = f"{job.model_name}/{condition_label}"
     try:
         horizon_steps = (
             fixed_sequence_horizon_steps(env) if args.fixed_sequence
@@ -847,6 +1009,7 @@ def run_evaluation(args: argparse.Namespace) -> None:
             "model_path": str(model_path),
             "scenario_name": args.scenario_name,
             "output_dir": str(output_dir),
+            "device": str(device),
             "seeds": seeds,
             "horizon_sec": horizon_steps * env.time_interval if args.fixed_sequence else args.horizon_sec,
             "horizon_steps": horizon_steps,
@@ -858,21 +1021,29 @@ def run_evaluation(args: argparse.Namespace) -> None:
             },
             "clamp_targets_to_safe_range": CLAMP_TARGETS_TO_SAFE_RANGE,
             "write_timeseries": not args.no_timeseries and WRITE_TIMESERIES,
-            "make_plots": not args.no_plots and MAKE_PLOTS,
+            "make_plots": condition is None and not args.no_plots and MAKE_PLOTS,
         }
+        if condition is not None:
+            config["observation_condition"] = asdict(condition)
+            config["sensor_seed"] = SENSOR_SEED
+        if job.model_name is not None:
+            config["model"] = job.model_name
         if args.fixed_sequence:
             config["fixed_sequence"] = fixed_sequence_config(horizon_steps, env.time_interval)
         else:
             config["commands"] = [asdict(command) for command in commands]
 
-        print(f"模型: {model_path}")
-        print(f"输出目录: {output_dir}")
-        trial_kind = "固定序列" if args.fixed_sequence else "单指令"
-        print(f"总实验数: {total_trials} = {len(seeds)} 个种子 × {len(commands)} 条{trial_kind}")
+        if condition is None:
+            print(f"模型: {model_path}")
+            print(f"输出目录: {output_dir}")
+            trial_kind = "固定序列" if args.fixed_sequence else "单指令"
+            print(f"总实验数: {total_trials} = {len(seeds)} 个种子 × {len(commands)} 条{trial_kind}")
+        else:
+            print(f"{condition_label} 开始评估，共 {total_trials} 局", flush=True)
         for seed in seeds:
             for command in commands:
                 trial_id += 1
-                if PRINT_EACH_TRIAL:
+                if condition is None and PRINT_EACH_TRIAL:
                     label = f"[{trial_id}/{total_trials}] seed={seed}"
                     if command is not None:
                         label += (
@@ -889,11 +1060,14 @@ def run_evaluation(args: argparse.Namespace) -> None:
                     command=command,
                     horizon_steps=horizon_steps,
                     device=device,
+                    condition=condition,
                 )
                 episode_rows.append(episode_row)
                 stage_rows.extend(trial_stages)
                 if config["write_timeseries"]:
                     timeseries_rows.extend(trial_records)
+                if condition is not None and trial_id % 100 == 0:
+                    print(f"{condition_label} 已完成 {trial_id}/{total_trials} 局", flush=True)
     finally:
         env.close()
 
@@ -907,12 +1081,58 @@ def run_evaluation(args: argparse.Namespace) -> None:
         plot_timeseries(timeseries_rows, output_dir)
 
     overall = summarize_rows(episode_rows)
+    if condition is not None:
+        overall["actual_dropout_rate_mean"] = float(np.mean([row["actual_dropout_rate"] for row in episode_rows]))
+        print(f"{condition_label} 完成 {total_trials} 局，成功率 {overall['success_rate']:.2%}", flush=True)
+        result = {"condition": condition.name, **overall}
+        return {"model": job.model_name, **result} if job.model_name is not None else result
+
     print("\n完成。核心结果：")
     print(f"success_rate={overall.get('success_rate', 0.0):.3f}")
     print(f"violation_episode_rate={overall.get('violation_episode_rate', 0.0):.3f}")
     print(f"heading_final_abs_deg_mean={overall.get('heading_final_abs_deg_mean', 0.0):.3f}")
     print(f"altitude_final_abs_m_mean={overall.get('altitude_final_abs_m_mean', 0.0):.3f}")
     print(f"speed_final_abs_mps_mean={overall.get('speed_final_abs_mps_mean', 0.0):.3f}")
+    return overall
+
+
+def run_evaluation(args: argparse.Namespace) -> None:
+    output_dir = args.output_dir.resolve()
+    if not args.observation_degradation:
+        run_condition(args, EvaluationJob(args.model_path.resolve(), output_dir))
+        return
+
+    model_paths: dict[str | None, Path] = {}
+    if args.models:
+        # 提交长时间评估前检查所有权重和编码器是否匹配。
+        torch.set_num_threads(1)
+        for name, path in args.models.items():
+            model_paths[name] = load_named_actor(
+                path, MODEL_ENCODERS[name], torch.device("cpu"), prefer_best=args.prefer_best,
+            )[0]
+    else:
+        model_paths[None] = args.model_path.resolve()
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    print(f"输出目录: {output_dir}", flush=True)
+    jobs = []
+    for model_name, path in model_paths.items():
+        model_dir = output_dir if model_name is None else output_dir / model_name
+        print(f"{model_name or '模型'}: {path}", flush=True)
+        jobs.extend(
+            EvaluationJob(path, model_dir / condition.name, condition, model_name)
+            for condition in OBSERVATION_DEGRADATION_CONDITIONS
+        )
+    if args.workers == 1:
+        rows = [run_condition(args, job) for job in jobs]
+    else:
+        with ProcessPoolExecutor(max_workers=min(args.workers, len(jobs))) as pool:
+            rows = list(pool.map(run_condition, repeat(args), jobs))
+
+    write_csv(output_dir / "summary.csv", rows)
+    if not args.no_plots and MAKE_PLOTS:
+        plot_degradation_summary(rows, output_dir)
+    print(f"完成：{output_dir / 'summary.csv'}", flush=True)
 
 
 def main() -> None:
