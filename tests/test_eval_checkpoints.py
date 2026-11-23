@@ -230,3 +230,104 @@ def test_no_evaluation_preserves_training_budget(runner_modules, tmp_path):
     assert not runner.evaluated_steps
     assert "actor_best.pt" not in runner_modules.saved
     assert runner_modules.saved["actor_latest.pt"] == {"actor_update": 20}
+
+
+def test_selfplay_eval_handles_multiple_opponents_with_async_parallel_dones(runner_modules, tmp_path, monkeypatch):
+    """验证多对手并行评估时，即使各线程异步结束且总结束数非整倍数，也能精确按对手统计且不触发 np.split 报错。"""
+    args = get_config().parse_args([])
+    args.scenario_name = "test"
+    args.use_eval = True
+    args.use_selfplay = True
+    args.n_choose_opponents = 4
+    args.eval_episodes = 10
+    args.n_eval_rollout_threads = 3
+
+    class FakeTensor:
+        def __init__(self, array):
+            self._array = np.asarray(array, dtype=np.float32)
+
+        def detach(self):
+            return self
+
+        def cpu(self):
+            return self
+
+        def numpy(self):
+            return self._array
+
+    class FakePolicy:
+        def __init__(self):
+            self.loaded = []
+            self.actor = SimpleNamespace(load_state_dict=lambda state: self.loaded.append(state["id"]))
+
+        def prep_rollout(self):
+            pass
+
+        def act(self, obs, rnn_states, masks, deterministic=True):
+            batch = obs.shape[0]
+            return FakeTensor(np.zeros((batch, 1), dtype=np.float32)), FakeTensor(rnn_states)
+
+    class AsyncEvalEnv:
+        def __init__(self, n_threads):
+            self.n_threads = n_threads
+            self.step_count = 0
+
+        def reset(self):
+            self.step_count = 0
+            return np.zeros((self.n_threads, 2, 15), dtype=np.float32)
+
+        def step(self, actions):
+            self.step_count += 1
+            obs = np.zeros((self.n_threads, 2, 15), dtype=np.float32)
+            rewards = np.zeros((self.n_threads, 2, 1), dtype=np.float32)
+            rewards[:, 0, 0] = 50.0
+            rewards[:, 1, 0] = 10.0
+            dones = np.zeros((self.n_threads, 2, 1), dtype=bool)
+            # 故意制造每步结束 2 个环境（3 线程下第 2 步完成 4 局 > target=3），覆盖截断逻辑。
+            dones[0] = True
+            dones[1] = True
+            return obs, rewards, dones, [{} for _ in range(self.n_threads)]
+
+    monkeypatch.setattr(
+        runner_modules.selfplay_jsbsim_runner.torch,
+        "load",
+        lambda path, weights_only=True: {"id": Path(path).stem},
+        raising=False,
+    )
+
+    opponents = iter(["0", "10", "20", "30"])
+    runner_cls = runner_modules.selfplay_jsbsim_runner.SelfplayJSBSimRunner
+
+    class EvalHarness(runner_cls):
+        def load(self):
+            self.use_selfplay = True
+            self.num_agents = 2
+            self.num_opponents = args.n_choose_opponents
+            self.latest_elo = 1000.0
+            self.policy_pool = {"0": 1000.0, "10": 1000.0, "20": 1000.0, "30": 1000.0}
+            self.selfplay_algo = SimpleNamespace(choose=lambda pool: next(opponents))
+            self.policy = FakePolicy()
+            self.eval_opponent_policy = FakePolicy()
+            self.buffer = SimpleNamespace(
+                rewards=np.zeros((2, 1, 1, 1), dtype=np.float32),
+                masks=np.ones((2, 1, 1, 1), dtype=np.float32),
+                rnn_states_actor=np.zeros((2, 1, 1, 1, 4), dtype=np.float32),
+            )
+            self.reset_called = False
+
+        def reset_opponent(self):
+            self.reset_called = True
+
+    runner = EvalHarness({
+        "all_args": args,
+        "envs": SimpleNamespace(),
+        "eval_envs": AsyncEvalEnv(args.n_eval_rollout_threads),
+        "device": "cpu",
+        "render_mode": "txt",
+        "run_dir": tmp_path,
+    })
+
+    mean_reward = runner.eval(total_num_steps=1000)
+    assert mean_reward == pytest.approx(50.0)
+    assert runner.eval_opponent_policy.loaded == ["actor_0", "actor_10", "actor_20", "actor_30"]
+    assert runner.reset_called is True

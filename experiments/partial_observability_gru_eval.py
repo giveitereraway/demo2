@@ -29,6 +29,7 @@ import numpy as np
 
 if TYPE_CHECKING:
     from envs.JSBSim.envs.selfplay_observation import OwnshipDegradationSpec
+    from envs.JSBSim.envs.singlecombat_env import RadarDegradationSpec
 
 
 # =============================================================================
@@ -149,14 +150,23 @@ class DegradationConfig:
 
 
 @dataclass(frozen=True)
+class JointDegradationSpec:
+    """联合观测退化参数：同时记录本机状态退化与火控雷达航迹退化。"""
+
+    ownship: "OwnshipDegradationSpec"
+    radar: "RadarDegradationSpec"
+
+
+@dataclass(frozen=True)
 class ExperimentCondition:
     """一个可独立运行的实验组。"""
 
     condition_id: str
     label: str
-    degradation: DegradationConfig | OwnshipDegradationSpec
+    degradation: DegradationConfig | "OwnshipDegradationSpec" | "RadarDegradationSpec" | JointDegradationSpec
     sensor_seed_group: int = 0
     ownship_level: Optional[int] = None
+    radar_level: Optional[int] = None
 
 
 MIXED_DEGRADATION_CONFIGS = {
@@ -206,6 +216,48 @@ def ownship_conditions(*, quick: bool) -> Tuple[ExperimentCondition, ...]:
             OWN_SHIP_DEGRADATION_SPECS[level],
             sensor_seed_group=int(level > 0),
             ownship_level=level,
+        )
+        for level in levels
+    )
+
+
+def radar_conditions(*, quick: bool) -> Tuple[ExperimentCondition, ...]:
+    from envs.JSBSim.envs.selfplay_observation import JOINT_EVAL_LEVEL
+    from envs.JSBSim.envs.singlecombat_env import RADAR_DEGRADATION_SPECS
+
+    levels = (0, JOINT_EVAL_LEVEL) if quick else range(len(RADAR_DEGRADATION_SPECS))
+    return tuple(
+        ExperimentCondition(
+            f"E{level}",
+            "完整观测" if level == 0 else f"火控雷达航迹退化 E{level}",
+            RADAR_DEGRADATION_SPECS[level],
+            sensor_seed_group=int(level > 0),
+            radar_level=level,
+        )
+        for level in levels
+    )
+
+
+def joint_conditions(*, quick: bool) -> Tuple[ExperimentCondition, ...]:
+    from envs.JSBSim.envs.selfplay_observation import (
+        JOINT_DEGRADATION_MAX_LEVEL,
+        JOINT_EVAL_LEVEL,
+        OWN_SHIP_DEGRADATION_SPECS,
+    )
+    from envs.JSBSim.envs.singlecombat_env import RADAR_DEGRADATION_SPECS
+
+    levels = (0, JOINT_EVAL_LEVEL) if quick else range(JOINT_DEGRADATION_MAX_LEVEL + 1)
+    return tuple(
+        ExperimentCondition(
+            f"E{level}",
+            "完整观测" if level == 0 else f"联合观测退化（本机+雷达） E{level}",
+            JointDegradationSpec(
+                ownship=OWN_SHIP_DEGRADATION_SPECS[level],
+                radar=RADAR_DEGRADATION_SPECS[level],
+            ),
+            sensor_seed_group=int(level > 0),
+            ownship_level=level,
+            radar_level=level,
         )
         for level in levels
     )
@@ -505,6 +557,7 @@ def run_episode(
     condition_dir: Path,
     *,
     save_acmi: bool = True,
+    degrade_both: bool = False,
 ) -> Dict[str, object]:
     actor_a.reset()
     actor_b.reset()
@@ -524,37 +577,60 @@ def run_episode(
     actor_a_agent_id = actor_to_agent_id["actor_a"]
     actor_b_agent_id = actor_to_agent_id["actor_b"]
 
-    sensor_rng = np.random.default_rng(
-        SENSOR_SEED + condition.sensor_seed_group * 100000 + episode
-    )
-    use_radar_track_degrader = bool(getattr(actor_a, "is_tactical", False))
-    radar_degrader = None
-    if condition.ownship_level is not None:
-        from envs.JSBSim.envs.selfplay_observation import OwnshipObservationDegrader
+    degraded_actors = ("actor_a", "actor_b") if degrade_both else ("actor_a",)
+    base_seed = SENSOR_SEED + condition.sensor_seed_group * 100000 + episode
+    ownship_degraders: Dict[str, Any] = {}
+    radar_degraders: Dict[str, Any] = {}
+    relative_degraders: Dict[str, ObservationDegrader] = {}
 
-        degrader = OwnshipObservationDegrader(condition.ownship_level, obs[actor_a_slot], sensor_rng)
-    elif use_radar_track_degrader:
-        from envs.JSBSim.envs.singlecombat_env import (
-            RadarDegradationSpec,
-            RadarTrackDegrader,
-            extract_true_enemy_track,
+    for actor_index, actor_name in enumerate(degraded_actors):
+        slot = actor_to_slot[actor_name]
+        agent_id = actor_to_agent_id[actor_name]
+        controller = slot_controllers[slot]
+        # Actor A 保持原随机种子不变，保证既有单方退化评估结果完全可复现；Actor B 使用独立偏移种子。
+        ownship_rng = np.random.default_rng(base_seed + actor_index * 1000003)
+        radar_rng = np.random.default_rng(
+            base_seed + (500009 if condition.ownship_level is not None else 0) + actor_index * 1000003
         )
+        if condition.ownship_level is not None:
+            from envs.JSBSim.envs.selfplay_observation import OwnshipObservationDegrader
 
-        deg = condition.degradation
-        radar_spec = RadarDegradationSpec(
-            dropout_probability=deg.dropout_probability,
-            delay_steps=deg.delay_steps,
-            range_noise_std_m=deg.range_noise_std_m,
-            azimuth_noise_std_deg=deg.angle_noise_std_deg,
-            altitude_noise_std_m=deg.relative_altitude_noise_std_m,
-            velocity_noise_std_mps=deg.relative_speed_noise_std_mps,
-        )
-        radar_degrader = RadarTrackDegrader(radar_spec, sensor_rng)
-        radar_degrader.reset(extract_true_enemy_track(env, actor_a_agent_id))
-        degrader = None
-    else:
-        degrader = ObservationDegrader(condition.degradation, sensor_rng)
-        degrader.reset(obs[actor_a_slot])
+            ownship_degraders[actor_name] = OwnshipObservationDegrader(
+                condition.ownship_level, obs[slot], ownship_rng
+            )
+        if condition.radar_level is not None:
+            from envs.JSBSim.envs.singlecombat_env import (
+                RADAR_DEGRADATION_SPECS,
+                RadarTrackDegrader,
+                extract_true_enemy_track,
+            )
+
+            radar_degrader = RadarTrackDegrader(RADAR_DEGRADATION_SPECS[condition.radar_level], radar_rng)
+            radar_degrader.reset(extract_true_enemy_track(env, agent_id))
+            radar_degraders[actor_name] = radar_degrader
+        elif condition.ownship_level is None and bool(getattr(controller, "is_tactical", False)):
+            from envs.JSBSim.envs.singlecombat_env import (
+                RadarDegradationSpec,
+                RadarTrackDegrader,
+                extract_true_enemy_track,
+            )
+
+            deg = condition.degradation
+            radar_spec = RadarDegradationSpec(
+                dropout_probability=deg.dropout_probability,
+                delay_steps=deg.delay_steps,
+                range_noise_std_m=deg.range_noise_std_m,
+                azimuth_noise_std_deg=deg.angle_noise_std_deg,
+                altitude_noise_std_m=deg.relative_altitude_noise_std_m,
+                velocity_noise_std_mps=deg.relative_speed_noise_std_mps,
+            )
+            radar_degrader = RadarTrackDegrader(radar_spec, radar_rng)
+            radar_degrader.reset(extract_true_enemy_track(env, agent_id))
+            radar_degraders[actor_name] = radar_degrader
+        elif condition.ownship_level is None:
+            degrader = ObservationDegrader(condition.degradation, ownship_rng)
+            degrader.reset(obs[slot])
+            relative_degraders[actor_name] = degrader
 
     actor_rewards = {"actor_a": 0.0, "actor_b": 0.0}
     relative_history: Dict[str, List[float]] = {}
@@ -574,23 +650,33 @@ def run_episode(
         for slot, controller in enumerate(slot_controllers):
             controller_obs = obs[slot]
             agent_id = actor_to_agent_id[controller.name]
-            if controller.name == "actor_a":
-                if radar_degrader is not None:
-                    from envs.JSBSim.envs.singlecombat_env import extract_true_enemy_track
+            actor_name = controller.name
+            radar_degrader = radar_degraders.get(actor_name)
+            ownship_degrader = ownship_degraders.get(actor_name)
+            relative_degrader = relative_degraders.get(actor_name)
 
-                    degraded_track = radar_degrader.transform(
-                        env.agents[agent_id].get_position(),
-                        extract_true_enemy_track(env, agent_id),
-                    )
-                    env._radar_track_overrides = {agent_id: degraded_track}
-                    try:
-                        controller_obs = env.task.get_obs(env, agent_id).astype(np.float32)
-                        action_out = controller.act(controller_obs, env=env, agent_id=agent_id)
-                    finally:
-                        env._radar_track_overrides = None
-                    actions.append(action_out)
-                    continue
-                controller_obs = degrader.transform(controller_obs)
+            if radar_degrader is not None:
+                from envs.JSBSim.envs.singlecombat_env import extract_true_enemy_track
+
+                degraded_track = radar_degrader.transform(
+                    env.agents[agent_id].get_position(),
+                    extract_true_enemy_track(env, agent_id),
+                )
+                env._radar_track_overrides = {agent_id: degraded_track}
+                try:
+                    controller_obs = env.task.get_obs(env, agent_id).astype(np.float32)
+                    if ownship_degrader is not None:
+                        controller_obs = ownship_degrader.transform(controller_obs)
+                    action_out = controller.act(controller_obs, env=env, agent_id=agent_id)
+                finally:
+                    env._radar_track_overrides = None
+                actions.append(action_out)
+                continue
+
+            if ownship_degrader is not None:
+                controller_obs = ownship_degrader.transform(controller_obs)
+            elif relative_degrader is not None:
+                controller_obs = relative_degrader.transform(controller_obs)
             actions.append(
                 controller.act(
                     controller_obs,
@@ -647,6 +733,16 @@ def run_episode(
     continuity_summary = action_continuity_metrics(normalized_actor_a_actions)
     total_metric_steps = max(len(relative_history.get("distance_m", [])), 1)
 
+    actor_a_ownship_degrader = ownship_degraders.get("actor_a")
+    actor_a_radar_degrader = radar_degraders.get("actor_a")
+    actor_a_relative_degrader = relative_degraders.get("actor_a")
+    dropout_rates = [
+        item.actual_dropout_rate
+        for item in (actor_a_ownship_degrader, actor_a_radar_degrader, actor_a_relative_degrader)
+        if item is not None
+    ]
+    actual_dropout_rate = float(np.mean(dropout_rates)) if dropout_rates else 0.0
+
     row: Dict[str, object] = {
         "condition_id": condition.condition_id,
         "condition_label": condition.label,
@@ -668,8 +764,12 @@ def run_episode(
         "actor_a_mean_ao_deg": metric_mean(relative_history, "actor_a_ao_deg"),
         "actor_a_mean_ta_deg": metric_mean(relative_history, "actor_a_ta_deg"),
         "mean_distance_m": metric_mean(relative_history, "distance_m"),
-        "actual_dropout_rate": (
-            radar_degrader.actual_dropout_rate if radar_degrader is not None else degrader.actual_dropout_rate
+        "actual_dropout_rate": actual_dropout_rate,
+        "ownship_dropout_rate": (
+            actor_a_ownship_degrader.actual_dropout_rate if actor_a_ownship_degrader is not None else 0.0
+        ),
+        "radar_dropout_rate": (
+            actor_a_radar_degrader.actual_dropout_rate if actor_a_radar_degrader is not None else 0.0
         ),
         "acmi_path": str(acmi_path) if acmi_path is not None else "",
         **initial_summary,
@@ -950,6 +1050,12 @@ def parse_cli_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=None, help="自定义结果输出目录")
     parser.add_argument("--ownship-degradation", action="store_true",
                         help="只运行普通无武器 Selfplay 的 E0/E2 快验，默认运行 E0–E6")
+    parser.add_argument("--degradation-mode", choices=["ownship", "radar", "joint"], default=None,
+                        help="显式指定退化口径：ownship（仅前9维本机）、radar（仅后6维雷达）、joint（本机+雷达联合）")
+    parser.add_argument("--quick", action="store_true",
+                        help="仅运行 E0 与 E2 两档快验（适用于 ownship / radar / joint 模式）")
+    parser.add_argument("--degrade-both", action="store_true",
+                        help="红蓝双方同时施加同档观测退化，用于公平的跨实验 1v1 对抗评估")
     return parser.parse_args(argv)
 
 
@@ -976,17 +1082,37 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     configure_base_module(base)
     from envs.JSBSim.envs.selfplay_observation import SELFPLAY_SCENARIO, validate_unarmed_selfplay
 
-    use_ownship = (actor_a_scenario, actor_b_scenario, eval_scenario) == (SELFPLAY_SCENARIO,) * 3
-    if cli.ownship_degradation and not use_ownship:
+    is_unarmed_selfplay = (actor_a_scenario, actor_b_scenario, eval_scenario) == (SELFPLAY_SCENARIO,) * 3
+    quick_mode = bool(cli.quick or cli.ownship_degradation)
+    if cli.ownship_degradation and cli.degradation_mode not in (None, "ownship"):
+        raise ValueError("--ownship-degradation 与非 ownship 的 --degradation-mode 冲突")
+    if cli.ownship_degradation and not is_unarmed_selfplay:
         raise ValueError("本机状态退化快验的双方模型和评估环境都须使用普通无武器 Selfplay")
-    if use_ownship:
+
+    selected_mode = cli.degradation_mode
+    if selected_mode is None:
+        selected_mode = "ownship" if is_unarmed_selfplay else "relative"
+
+    if selected_mode in ("ownship", "joint"):
+        if not is_unarmed_selfplay:
+            raise ValueError(f"{selected_mode} 退化评估的双方模型和评估环境都须使用普通无武器 Selfplay")
         from envs.JSBSim.utils.utils import parse_config
 
         validate_unarmed_selfplay(parse_config(SELFPLAY_SCENARIO))
-        conditions = ownship_conditions(quick=cli.ownship_degradation)
+        conditions = (
+            ownship_conditions(quick=quick_mode)
+            if selected_mode == "ownship"
+            else joint_conditions(quick=quick_mode)
+        )
+        observation_mode = f"{selected_mode}_degradation"
+    elif selected_mode == "radar":
+        conditions = radar_conditions(quick=quick_mode)
+        observation_mode = "radar_degradation"
     else:
         validate_experiment_design()
         conditions = RELATIVE_CONDITIONS
+        observation_mode = "relative_degradation"
+
     np.random.seed(ENV_SEED)
     base.torch.manual_seed(ENV_SEED)
     device = base.resolve_device(device_name)
@@ -1001,7 +1127,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         "eval_scenario_name": eval_scenario,
         "num_episodes_per_condition": num_episodes,
         "device": str(device),
-        "observation_mode": "ownship_degradation" if use_ownship else "relative_degradation",
+        "observation_mode": observation_mode,
+        "degrade_both": bool(cli.degrade_both),
     })
     save_json(snapshot, output_dir / "config.json")
 
@@ -1021,6 +1148,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     print(f"输出目录: {output_dir}")
     print(f"设备: {device}")
     print(f"每组回合数: {num_episodes}")
+    print(f"退化口径: {observation_mode} | 双方同退化: {bool(cli.degrade_both)}")
 
     all_rows: List[Dict[str, object]] = []
     summaries: List[Dict[str, object]] = []
@@ -1041,7 +1169,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                     actor_a,
                     actor_b,
                     condition_dir,
-                    save_acmi=not cli.ownship_degradation,
+                    save_acmi=not quick_mode,
+                    degrade_both=bool(cli.degrade_both),
                 )
                 for episode in range(num_episodes)
             ]
@@ -1083,7 +1212,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     save_csv(all_rows, output_dir / "all_episodes.csv")
     save_csv(summaries, output_dir / "summary.csv")
     plot_paths = []
-    if not cli.ownship_degradation:
+    if not quick_mode:
         plot_paths = plot_summaries(summaries, output_dir)
         plot_paths.extend(plot_episode_reward_curves(all_rows, output_dir))
     combined_summary = {

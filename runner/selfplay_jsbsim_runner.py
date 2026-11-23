@@ -134,103 +134,110 @@ class SelfplayJSBSimRunner(JSBSimRunner):
         logging.info("\nStart evaluation...")
         self.policy.prep_rollout()
         total_episodes = 0
-        episode_rewards, opponent_episode_rewards = [], []
-        cumulative_rewards = np.zeros((self.n_eval_rollout_threads, *self.buffer.rewards.shape[2:]), dtype=np.float32)
-        opponent_cumulative_rewards= np.zeros_like(cumulative_rewards)
 
         # [Selfplay] Choose opponent policy for evaluation
         eval_choose_opponents = [self.selfplay_algo.choose(self.policy_pool) for _ in range(self.num_opponents)]
-        eval_each_episodes = self.eval_episodes // self.num_opponents
+        base_each_episodes, extra_episodes = divmod(self.eval_episodes, self.num_opponents)
         logging.info(f" Choose opponents {eval_choose_opponents} for evaluation")
 
-        eval_cur_opponent_idx = 0
+        eval_average_episode_rewards = np.zeros(self.num_opponents, dtype=np.float32)
+        opponent_average_episode_rewards = np.zeros(self.num_opponents, dtype=np.float32)
+
         # use for tacview's timestamp
         self.timestamp = 0
-        while total_episodes < self.eval_episodes:
+        for opponent_idx, policy_idx in enumerate(eval_choose_opponents):
+            # 逐个对手精确收集对应局数，避免多线程异步结束时 np.split 报错或跨对手串账。
+            target_episodes = base_each_episodes + (1 if opponent_idx < extra_episodes else 0)
+            self.eval_opponent_policy.actor.load_state_dict(
+                torch.load(str(self.save_dir) + f'/actor_{policy_idx}.pt', weights_only=True)
+            )
+            self.eval_opponent_policy.prep_rollout()
+            logging.info(
+                f" Load opponent {policy_idx} for evaluation ({total_episodes + 1}/{self.eval_episodes})"
+            )
 
-            # [Selfplay] Load opponent policy
-            if total_episodes >= eval_cur_opponent_idx * eval_each_episodes:
-                policy_idx = eval_choose_opponents[eval_cur_opponent_idx]
-                self.eval_opponent_policy.actor.load_state_dict(torch.load(str(self.save_dir) + f'/actor_{policy_idx}.pt', weights_only=True))
-                self.eval_opponent_policy.prep_rollout()
-                eval_cur_opponent_idx += 1
-                logging.info(f" Load opponent {policy_idx} for evaluation ({total_episodes + 1}/{self.eval_episodes})")
-
-                # reset obs/rnn/mask
-                obs = self.eval_envs.reset()
-                masks = np.ones((self.n_eval_rollout_threads, *self.buffer.masks.shape[2:]), dtype=np.float32)
-                rnn_states = np.zeros((self.n_eval_rollout_threads, *self.buffer.rnn_states_actor.shape[2:]), dtype=np.float32)
-                opponent_obs = obs[:, self.num_agents // 2:, ...]
-                obs = obs[:, :self.num_agents // 2, ...]
-                opponent_masks = np.ones_like(masks, dtype=np.float32)
-                opponent_rnn_states = np.zeros_like(rnn_states, dtype=np.float32)
-
-            # [Selfplay] get actions
-            actions, rnn_states = self.policy.act(np.concatenate(obs),
-                                                    np.concatenate(rnn_states),
-                                                    np.concatenate(masks), deterministic=True)
-            actions = np.array(np.split(_t2n(actions), self.n_eval_rollout_threads))
-            rnn_states = np.array(np.split(_t2n(rnn_states), self.n_eval_rollout_threads))
-
-            opponent_actions, opponent_rnn_states \
-                = self.eval_opponent_policy.act(np.concatenate(opponent_obs),
-                                                np.concatenate(opponent_rnn_states),
-                                                np.concatenate(opponent_masks), deterministic=True)
-            opponent_rnn_states = np.array(np.split(_t2n(opponent_rnn_states), self.n_eval_rollout_threads))
-            opponent_actions = np.array(np.split(_t2n(opponent_actions), self.n_eval_rollout_threads))
-            actions = np.concatenate((actions, opponent_actions), axis=1)
-
-            # Obser reward and next obs
-            obs, eval_rewards, dones, eval_infos = self.eval_envs.step(actions)
-            dones_env = np.all(dones.squeeze(axis=-1), axis=-1)
-            total_episodes += np.sum(dones_env)
-
-            # [Selfplay] Reset obs, masks, rnn_states
+            # reset obs/rnn/mask and cumulative rewards
+            obs = self.eval_envs.reset()
+            masks = np.ones((self.n_eval_rollout_threads, *self.buffer.masks.shape[2:]), dtype=np.float32)
+            rnn_states = np.zeros((self.n_eval_rollout_threads, *self.buffer.rnn_states_actor.shape[2:]), dtype=np.float32)
             opponent_obs = obs[:, self.num_agents // 2:, ...]
             obs = obs[:, :self.num_agents // 2, ...]
-            # 仅在新回合第一帧清空历史，后续帧恢复记忆；双方分别维护 mask。
-            masks.fill(1)
-            opponent_masks.fill(1)
-            masks[dones_env == True] = np.zeros(((dones_env == True).sum(), *masks.shape[1:]), dtype=np.float32)
-            rnn_states[dones_env == True] = np.zeros(((dones_env == True).sum(), *rnn_states.shape[1:]), dtype=np.float32)
+            opponent_masks = np.ones_like(masks, dtype=np.float32)
+            opponent_rnn_states = np.zeros_like(rnn_states, dtype=np.float32)
 
-            opponent_masks[dones_env == True] = \
-                np.zeros(((dones_env == True).sum(), *opponent_masks.shape[1:]), dtype=np.float32)
-            opponent_rnn_states[dones_env == True] = \
-                np.zeros(((dones_env == True).sum(), *opponent_rnn_states.shape[1:]), dtype=np.float32)
+            cumulative_rewards = np.zeros((self.n_eval_rollout_threads, *self.buffer.rewards.shape[2:]), dtype=np.float32)
+            opponent_cumulative_rewards = np.zeros_like(cumulative_rewards)
+            opponent_ego_rewards = []
+            opponent_enm_rewards = []
+            collected_episodes = 0
 
-            # [Selfplay] Get rewards
-            opponent_rewards = eval_rewards[:, self.num_agents//2:, ...]
-            opponent_cumulative_rewards += opponent_rewards
-            opponent_episode_rewards.append(opponent_cumulative_rewards[dones_env == True])
-            opponent_cumulative_rewards[dones_env == True] = 0
+            while collected_episodes < target_episodes:
+                # [Selfplay] get actions
+                actions, rnn_states = self.policy.act(np.concatenate(obs),
+                                                      np.concatenate(rnn_states),
+                                                      np.concatenate(masks), deterministic=True)
+                actions = np.array(np.split(_t2n(actions), self.n_eval_rollout_threads))
+                rnn_states = np.array(np.split(_t2n(rnn_states), self.n_eval_rollout_threads))
 
-            eval_rewards = eval_rewards[:, :self.num_agents // 2, ...]
-            cumulative_rewards += eval_rewards
-            episode_rewards.append(cumulative_rewards[dones_env == True])
-            cumulative_rewards[dones_env == True] = 0
-            
-            # Tacview real time render
-            if self.render_mode == "real_time":
-                render_data = [f"#{self.timestamp:.2f}\n"]
-                for sim in self.eval_envs.envs[0]._jsbsims.values():
-                    log_msg = sim.log()
-                    
-                    if log_msg is not None:
-                        render_data.append(log_msg + "\n")
-                        
-                render_data_str = "".join(render_data)
-                self.tacview.send_data_to_client(render_data_str)
-            self.timestamp += 0.2
+                opponent_actions, opponent_rnn_states \
+                    = self.eval_opponent_policy.act(np.concatenate(opponent_obs),
+                                                    np.concatenate(opponent_rnn_states),
+                                                    np.concatenate(opponent_masks), deterministic=True)
+                opponent_rnn_states = np.array(np.split(_t2n(opponent_rnn_states), self.n_eval_rollout_threads))
+                opponent_actions = np.array(np.split(_t2n(opponent_actions), self.n_eval_rollout_threads))
+                actions = np.concatenate((actions, opponent_actions), axis=1)
 
-        # Compute average episode rewards
-        episode_rewards = np.concatenate(episode_rewards) # shape (self.eval_episodes, self.num_agents, 1)
-        episode_rewards = episode_rewards.squeeze(-1).mean(axis=-1) # shape: (self.eval_episodes,)
-        eval_average_episode_rewards = np.array(np.split(episode_rewards, self.num_opponents)).mean(axis=-1) # shape (self.num_opponents,)
+                # Observe reward and next obs
+                obs, eval_rewards, dones, eval_infos = self.eval_envs.step(actions)
+                dones_env = np.all(dones.squeeze(axis=-1), axis=-1)
 
-        opponent_episode_rewards = np.concatenate(opponent_episode_rewards)
-        opponent_episode_rewards = opponent_episode_rewards.squeeze(-1).mean(axis=-1)
-        opponent_average_episode_rewards = np.array(np.split(opponent_episode_rewards, self.num_opponents)).mean(axis=-1)
+                # [Selfplay] Reset obs, masks, rnn_states
+                opponent_obs = obs[:, self.num_agents // 2:, ...]
+                obs = obs[:, :self.num_agents // 2, ...]
+                # 仅在新回合第一帧清空历史，后续帧恢复记忆；双方分别维护 mask。
+                masks.fill(1)
+                opponent_masks.fill(1)
+                if np.any(dones_env):
+                    done_count = int(np.sum(dones_env))
+                    masks[dones_env == True] = np.zeros((done_count, *masks.shape[1:]), dtype=np.float32)
+                    rnn_states[dones_env == True] = np.zeros((done_count, *rnn_states.shape[1:]), dtype=np.float32)
+                    opponent_masks[dones_env == True] = np.zeros((done_count, *opponent_masks.shape[1:]), dtype=np.float32)
+                    opponent_rnn_states[dones_env == True] = np.zeros((done_count, *opponent_rnn_states.shape[1:]), dtype=np.float32)
+
+                # [Selfplay] Get rewards
+                opponent_rewards = eval_rewards[:, self.num_agents // 2:, ...]
+                opponent_cumulative_rewards += opponent_rewards
+                eval_rewards = eval_rewards[:, :self.num_agents // 2, ...]
+                cumulative_rewards += eval_rewards
+
+                if np.any(dones_env):
+                    remaining = target_episodes - collected_episodes
+                    finished_ego = cumulative_rewards[dones_env == True][:remaining].copy()
+                    finished_enm = opponent_cumulative_rewards[dones_env == True][:remaining].copy()
+                    opponent_ego_rewards.append(finished_ego)
+                    opponent_enm_rewards.append(finished_enm)
+                    collected_episodes += len(finished_ego)
+                    total_episodes += len(finished_ego)
+                    cumulative_rewards[dones_env == True] = 0
+                    opponent_cumulative_rewards[dones_env == True] = 0
+
+                # Tacview real time render
+                if self.render_mode == "real_time":
+                    render_data = [f"#{self.timestamp:.2f}\n"]
+                    for sim in self.eval_envs.envs[0]._jsbsims.values():
+                        log_msg = sim.log()
+
+                        if log_msg is not None:
+                            render_data.append(log_msg + "\n")
+
+                    render_data_str = "".join(render_data)
+                    self.tacview.send_data_to_client(render_data_str)
+                self.timestamp += 0.2
+
+            ego_ep_rewards = np.concatenate(opponent_ego_rewards, axis=0).squeeze(-1).mean(axis=-1)
+            enm_ep_rewards = np.concatenate(opponent_enm_rewards, axis=0).squeeze(-1).mean(axis=-1)
+            eval_average_episode_rewards[opponent_idx] = float(ego_ep_rewards.mean())
+            opponent_average_episode_rewards[opponent_idx] = float(enm_ep_rewards.mean())
 
         # Update elo
         '''

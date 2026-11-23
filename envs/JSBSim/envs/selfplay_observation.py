@@ -3,7 +3,12 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .singlecombat_env import SingleCombatEnv
+from .singlecombat_env import (
+    RADAR_DEGRADATION_SPECS,
+    RadarTrackDegrader,
+    SingleCombatEnv,
+    extract_true_enemy_track,
+)
 
 
 SELFPLAY_SCENARIO = "1v1/NoWeapon/Selfplay"
@@ -31,6 +36,9 @@ OWN_SHIP_DEGRADATION_SPECS = (
 )
 OWN_SHIP_TRAIN_PROBABILITIES = (0.30, 0.35, 0.35)
 OWN_SHIP_EVAL_LEVEL = 2
+JOINT_DEGRADATION_MAX_LEVEL = min(len(OWN_SHIP_DEGRADATION_SPECS), len(RADAR_DEGRADATION_SPECS)) - 1
+JOINT_TRAIN_PROBABILITIES = OWN_SHIP_TRAIN_PROBABILITIES
+JOINT_EVAL_LEVEL = OWN_SHIP_EVAL_LEVEL
 
 
 def validate_unarmed_selfplay(config):
@@ -121,4 +129,86 @@ class SelfplayOwnshipDegradationEnv(SingleCombatEnv):
                             self._episode_level, obs, self._sensor_rngs[agent_id],
                         )
                     self._cached_obs[agent_id] = self._degraders[agent_id].transform(obs)
+        return {agent_id: obs.copy() for agent_id, obs in self._cached_obs.items()}
+
+
+class SelfplayJointDegradationEnv(SingleCombatEnv):
+    """普通无武器 1v1 的联合观测退化：前 9 维本机状态与后 6 维敌机火控雷达航迹同档同步退化。"""
+
+    def __init__(self, config_name: str, *, degradation_level: int | None = None):
+        if config_name != SELFPLAY_SCENARIO:
+            raise ValueError("联合观测退化仅支持 1v1/NoWeapon/Selfplay")
+        if degradation_level is not None and not 0 <= degradation_level <= JOINT_DEGRADATION_MAX_LEVEL:
+            raise ValueError(f"联合观测退化档位必须在 [0, {JOINT_DEGRADATION_MAX_LEVEL}] 范围内")
+        self.degradation_level = degradation_level
+        self._episode_level = 0
+        self._ownship_degraders = {}
+        self._ownship_rngs = {}
+        self._radar_degraders = {}
+        self._latest_radar_tracks = {}
+        self._obs_step = None
+        self._cached_obs = None
+        super().__init__(config_name)
+
+    def load_task(self):
+        validate_unarmed_selfplay(self.config)
+        super().load_task()
+
+    def seed(self, seed=None):
+        seeds = super().seed(seed)
+        self._episode_seeds = np.random.SeedSequence(seeds[0], spawn_key=(5,))
+        return seeds
+
+    def reset(self) -> np.ndarray:
+        num_agents = len(self.agents)
+        level_seed, *sensor_seeds = self._episode_seeds.spawn(1 + 2 * num_agents)
+        self._episode_level = self.degradation_level
+        if self._episode_level is None:
+            # 每局红蓝共享同一综合档位，避免不对称退化引入对局方差。
+            self._episode_level = int(np.random.default_rng(level_seed).choice(
+                len(JOINT_TRAIN_PROBABILITIES), p=JOINT_TRAIN_PROBABILITIES,
+            ))
+        ownship_seeds = sensor_seeds[:num_agents]
+        radar_seeds = sensor_seeds[num_agents:]
+        self._ownship_rngs = {
+            agent_id: np.random.default_rng(seed)
+            for agent_id, seed in zip(self.agents, ownship_seeds)
+        }
+        radar_spec = RADAR_DEGRADATION_SPECS[self._episode_level]
+        self._radar_degraders = {
+            agent_id: RadarTrackDegrader(radar_spec, np.random.default_rng(seed))
+            for agent_id, seed in zip(self.agents, radar_seeds)
+        }
+        self._ownship_degraders.clear()
+        self._latest_radar_tracks.clear()
+        self._obs_step = None
+        self._cached_obs = None
+        return super().reset()
+
+    def get_enemy_radar_track(self, agent_id: str) -> np.ndarray | None:
+        if self._episode_level == 0:
+            return None
+        return self._latest_radar_tracks.get(agent_id)
+
+    def get_obs(self):
+        if self._cached_obs is None or self._obs_step != self.current_step:
+            if self._episode_level:
+                for agent_id, sim in self.agents.items():
+                    true_track = extract_true_enemy_track(self, agent_id)
+                    self._latest_radar_tracks[agent_id] = self._radar_degraders[agent_id].transform(
+                        sim.get_position(), true_track,
+                    )
+            else:
+                self._latest_radar_tracks.clear()
+
+            # 先经任务读取退化后的敌机航迹计算后 6 维，再对前 9 维施加本机状态退化。
+            self._cached_obs = super().get_obs()
+            self._obs_step = self.current_step
+            if self._episode_level:
+                for agent_id, obs in self._cached_obs.items():
+                    if agent_id not in self._ownship_degraders:
+                        self._ownship_degraders[agent_id] = OwnshipObservationDegrader(
+                            self._episode_level, obs, self._ownship_rngs[agent_id],
+                        )
+                    self._cached_obs[agent_id] = self._ownship_degraders[agent_id].transform(obs)
         return {agent_id: obs.copy() for agent_id, obs in self._cached_obs.items()}
