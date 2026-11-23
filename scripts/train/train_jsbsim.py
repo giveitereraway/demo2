@@ -164,6 +164,8 @@ def parse_args(args, parser):
         encoder = get_memory_encoder(all_args)
         if encoder in {"temporal_attention", "gru_attention"} and all_args.env_name not in {"SingleControl", "SingleCombat"}:
             raise ValueError("时序注意力仅支持 SingleControl 和 SingleCombat 的 PPO 场景")
+        if encoder == "igru" and all_args.env_name not in {"SingleControl", "SingleCombat"}:
+            raise ValueError("新息门控残差 GRU 仅支持 SingleControl 和 SingleCombat 的 PPO 场景")
         if encoder == "lstm" and (not is_heading or all_args.use_selfplay):
             raise ValueError("LSTM 训练仅支持 SingleControl / 1/heading")
         if encoder == "lstm" and (all_args.recurrent_hidden_layers < 1 or all_args.recurrent_hidden_size < 1

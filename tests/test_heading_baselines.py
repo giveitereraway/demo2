@@ -32,12 +32,16 @@ def test_lstm_chunks_match_stepwise_rollout_with_resets():
     torch.testing.assert_close(reset_state, zero_state)
 
 
-@pytest.mark.parametrize("algorithm,encoder", [("ppo", "lstm"), ("sac", "mlp"), ("bdq", "mlp")])
-def test_heading_baseline_trains_evaluates_and_reloads(tmp_path, algorithm, encoder):
+@pytest.mark.parametrize("algorithm,encoder,policy_loss", [
+    ("ppo", "lstm", "clip"), ("ppo", "igru", "clip"), ("ppo", "igru", "spo"),
+    ("sac", "mlp", "clip"), ("bdq", "mlp", "clip"),
+])
+def test_heading_baseline_trains_evaluates_and_reloads(tmp_path, algorithm, encoder, policy_loss):
     torch.manual_seed(8)
     args = parse_args([
         "--env-name", "SingleControl", "--scenario-name", "1/heading",
         "--algorithm-name", algorithm, "--memory-encoder", encoder, "--heading-mixed-degradation",
+        "--policy-loss", policy_loss,
         "--n-rollout-threads", "1", "--buffer-size", "4", "--num-env-steps", "8",
         "--data-chunk-length", "2", "--ppo-epoch", "1", "--hidden-size", "8", "--act-hidden-size", "8",
         "--recurrent-hidden-size", "8", "--offpolicy-warmup-steps", "0", "--offpolicy-batch-size", "2",

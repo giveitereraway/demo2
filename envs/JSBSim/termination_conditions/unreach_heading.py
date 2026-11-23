@@ -19,6 +19,24 @@ class UnreachHeading(BaseTerminationCondition):
         self.check_interval = aircraft_config['check_interval']
         self.increment_size = [0.2, 0.4, 0.6, 0.8, 1.0] + [1.0] * 10
 
+    def advance_target(self, env, agent_id):
+        """按当前课程阶段以上一目标为基准采样，返回限幅前的指令增量。"""
+        sim = env.agents[agent_id]
+        delta = self.increment_size[env.heading_turn_counts]
+        delta_heading = env.np_random.uniform(-delta, delta) * self.max_heading_increment
+        delta_altitude = env.np_random.uniform(-delta, delta) * self.max_altitude_increment
+        delta_velocities_u = env.np_random.uniform(-delta, delta) * self.max_velocities_u_increment
+        new_heading = (sim.get_property_value(c.target_heading_deg) + delta_heading + 360) % 360
+        new_altitude = max(sim.get_property_value(c.target_altitude_ft) + delta_altitude, 15000)
+        new_velocities_u = max(sim.get_property_value(c.target_velocities_u_mps) + delta_velocities_u, 120.0)
+        sim.set_property_value(c.target_heading_deg, new_heading)
+        sim.set_property_value(c.target_altitude_ft, new_altitude)
+        sim.set_property_value(c.target_velocities_u_mps, new_velocities_u)
+        env.heading_turn_counts += 1
+        self.log(f'current_step:{env.current_step} target_heading:{new_heading} '
+                 f'target_altitude_ft:{new_altitude} target_velocities_u_mps:{new_velocities_u}')
+        return delta_heading, delta_altitude, delta_velocities_u
+
     def get_termination(self, task, env, agent_id, info={}):
         """
         Return whether the episode should terminate.
@@ -33,7 +51,6 @@ class UnreachHeading(BaseTerminationCondition):
         """
         done = False
         success = False
-        cur_step = info['current_step']
         check_time = env.agents[agent_id].get_property_value(c.heading_check_time)
         # check heading when simulation_time exceed check_time
         if env.agents[agent_id].get_property_value(c.simulation_sim_time_sec) >= check_time:
@@ -41,23 +58,8 @@ class UnreachHeading(BaseTerminationCondition):
                 done = True
             # if current target heading is reached, random generate a new target heading
             else:
-                delta = self.increment_size[env.heading_turn_counts]
-                delta_heading = env.np_random.uniform(-delta, delta) * self.max_heading_increment
-                delta_altitude = env.np_random.uniform(-delta, delta) * self.max_altitude_increment
-                delta_velocities_u = env.np_random.uniform(-delta, delta) * self.max_velocities_u_increment
-                new_heading = env.agents[agent_id].get_property_value(c.target_heading_deg) + delta_heading
-                new_heading = (new_heading + 360) % 360
-                new_altitude = env.agents[agent_id].get_property_value(c.target_altitude_ft) + delta_altitude
-                new_altitude = max(new_altitude, 15000) # assert the value in safe region
-                new_velocities_u = env.agents[agent_id].get_property_value(c.target_velocities_u_mps) + delta_velocities_u
-                new_velocities_u = max(new_velocities_u, 120.) # assert the value in safe region
-                env.agents[agent_id].set_property_value(c.target_heading_deg, new_heading)
-                env.agents[agent_id].set_property_value(c.target_altitude_ft, new_altitude)
-                env.agents[agent_id].set_property_value(c.target_velocities_u_mps, new_velocities_u)
+                self.advance_target(env, agent_id)
                 env.agents[agent_id].set_property_value(c.heading_check_time, check_time + self.check_interval)
-                env.heading_turn_counts += 1
-                self.log(f'current_step:{cur_step} target_heading:{new_heading} '
-                         f'target_altitude_ft:{new_altitude} target_velocities_u_mps:{new_velocities_u}')
         if done:
             self.log(f'agent[{agent_id}] unreached heading. Total Steps={env.current_step}')
             info['heading_turn_counts'] = env.heading_turn_counts

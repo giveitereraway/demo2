@@ -147,9 +147,18 @@ class PPOTrainer():
             and getattr(policy.actor, "memory_encoder", None) == "gru_attention"
             and hasattr(policy.actor.base, "last_gate_mean")
         )
+        has_igru_gate = (
+            hasattr(policy, "actor")
+            and getattr(policy.actor, "memory_encoder", None) == "igru"
+            and hasattr(policy.actor.base, "last_gate_mean")
+        )
         if has_gate:
             train_info['actor_attention_gate'] = 0
             train_info['critic_attention_gate'] = 0
+        if has_igru_gate:
+            train_info['actor_igru_in_gate'] = 0
+            train_info['actor_igru_res_gate'] = 0
+            train_info['critic_igru_res_gate'] = 0
 
         for _ in range(self.ppo_epoch):
             if self.use_recurrent_policy:
@@ -184,6 +193,10 @@ class PPOTrainer():
                 if has_gate:
                     train_info['actor_attention_gate'] += float(policy.actor.base.last_gate_mean)
                     train_info['critic_attention_gate'] += float(policy.critic.base.last_gate_mean)
+                if has_igru_gate:
+                    train_info['actor_igru_in_gate'] += float(policy.actor.base.last_in_gate_mean)
+                    train_info['actor_igru_res_gate'] += float(policy.actor.base.last_gate_mean)
+                    train_info['critic_igru_res_gate'] += float(policy.critic.base.last_gate_mean)
 
         num_updates = self.ppo_epoch * self.num_mini_batch
 

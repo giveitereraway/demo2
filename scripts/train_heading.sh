@@ -6,11 +6,13 @@
 #   SEED=1 sh scripts/train_heading.sh clip mlp mixed
 #   SEED=1 sh scripts/train_heading.sh clip gru mixed
 #   SEED=1 sh scripts/train_heading.sh clip lstm mixed
+#   SEED=1 sh scripts/train_heading.sh clip igru mixed
 #   SEED=1 sh scripts/train_heading.sh spo mlp mixed
 #   SEED=1 sh scripts/train_heading.sh sac mlp mixed
 #   SEED=1 sh scripts/train_heading.sh bdq mlp mixed
 #   SEED=1 sh scripts/train_heading.sh clip gru_attention mixed
 #   SEED=1 sh scripts/train_heading.sh spo gru mixed
+#   SEED=1 sh scripts/train_heading.sh spo igru mixed
 #   SEED=1 sh scripts/train_heading.sh spo gru_attention mixed
 
 cd "$(dirname "$0")" || exit 1
@@ -50,7 +52,7 @@ case "$encoder" in
     mlp)
         set -- "$@" --hidden-size "128 128"
         ;;
-    gru|lstm)
+    gru|lstm|igru)
         set -- "$@" --hidden-size "128 128" \
             --recurrent-hidden-size 128 --recurrent-hidden-layers 1 \
             --data-chunk-length "${DATA_CHUNK_LENGTH:-10}"
@@ -65,7 +67,7 @@ case "$encoder" in
         set -- "$@" --history-length "${HISTORY_LENGTH:-16}" --attention-hidden-size 128 --attention-heads 4
         ;;
     *)
-        echo "编码器须为 mlp、gru、lstm、gru_attention 或 temporal_attention" >&2
+        echo "编码器须为 mlp、gru、lstm、igru、gru_attention 或 temporal_attention" >&2
         exit 1
         ;;
 esac

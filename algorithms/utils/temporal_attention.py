@@ -16,6 +16,8 @@ def get_memory_encoder(args):
         raise ValueError("--memory-encoder 与关闭 GRU 的旧参数 --use-recurrent-policy 冲突，请移除旧参数")
     if encoder in {"temporal_attention", "gru_attention"} and getattr(args, "algorithm_name", "ppo") != "ppo":
         raise ValueError("时序注意力仅支持 PPO，暂不支持 MAPPO")
+    if encoder == "igru" and getattr(args, "algorithm_name", "ppo") != "ppo":
+        raise ValueError("新息门控残差 GRU 仅支持 PPO 训练入口")
     if encoder == "lstm" and getattr(args, "algorithm_name", "ppo") != "ppo":
         raise ValueError("LSTM 编码器仅支持 PPO 训练入口")
     return encoder
@@ -23,11 +25,11 @@ def get_memory_encoder(args):
 
 def is_recurrent_sequence_encoder(args) -> bool:
     """判断编码器是否通过 recurrent_generator 按时间块训练。"""
-    return get_memory_encoder(args) in {"gru", "lstm", "gru_attention"}
+    return get_memory_encoder(args) in {"gru", "lstm", "gru_attention", "igru"}
 
 
 def get_policy_state_shape(args, obs_space):
-    """返回策略记忆状态形状，注意力类编码器复用现有 rnn_states 通道。"""
+    """返回策略记忆状态形状，时序编码器复用现有 rnn_states 通道。"""
     encoder = get_memory_encoder(args)
     if encoder == "temporal_attention":
         if len(obs_space.shape) != 1 or args.history_length < 1:
@@ -41,6 +43,13 @@ def get_policy_state_shape(args, obs_space):
         gru_dim = args.recurrent_hidden_layers * args.recurrent_hidden_size
         hist_dim = args.history_length * (obs_space.shape[0] + 1)
         return 1, gru_dim + hist_dim
+    if encoder == "igru":
+        if len(obs_space.shape) != 1:
+            raise ValueError("新息门控残差 GRU 要求一维观测")
+        if args.recurrent_hidden_layers < 1 or args.recurrent_hidden_size < 1:
+            raise ValueError("GRU 层数和隐状态维数必须为正整数")
+        gru_dim = args.recurrent_hidden_layers * args.recurrent_hidden_size
+        return 1, gru_dim + obs_space.shape[0] + 1
     if encoder == "lstm":
         if args.recurrent_hidden_layers < 1 or args.recurrent_hidden_size < 1:
             raise ValueError("LSTM 层数和隐状态维数必须为正整数")
