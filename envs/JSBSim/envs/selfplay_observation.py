@@ -12,6 +12,11 @@ from .singlecombat_env import (
 
 
 SELFPLAY_SCENARIO = "1v1/NoWeapon/Selfplay"
+TACTICAL_SELFPLAY_SCENARIO = "1v1/NoWeapon/TacticalHierarchySelfplay"
+UNARMED_SELFPLAY_TASKS = {
+    SELFPLAY_SCENARIO: "singlecombat",
+    TACTICAL_SELFPLAY_SCENARIO: "tactical_hierarchical_singlecombat",
+}
 OWN_SHIP_STATE = slice(0, 9)
 
 
@@ -41,9 +46,9 @@ JOINT_TRAIN_PROBABILITIES = OWN_SHIP_TRAIN_PROBABILITIES
 JOINT_EVAL_LEVEL = OWN_SHIP_EVAL_LEVEL
 
 
-def validate_unarmed_selfplay(config):
-    if config.task != "singlecombat" or getattr(config, "use_artillery", False):
-        raise ValueError("本机状态退化要求普通无武器 Selfplay 场景")
+def validate_unarmed_selfplay(config, config_name: str = SELFPLAY_SCENARIO):
+    if config.task != UNARMED_SELFPLAY_TASKS[config_name] or getattr(config, "use_artillery", False):
+        raise ValueError(f"观测退化要求场景 {config_name} 使用对应的无武器自博弈任务并关闭火炮")
 
 
 class OwnshipObservationDegrader:
@@ -80,11 +85,12 @@ class OwnshipObservationDegrader:
 
 
 class SelfplayOwnshipDegradationEnv(SingleCombatEnv):
-    """普通无武器 1v1 的本机状态混合观测退化。"""
+    """无武器 1v1 的本机状态混合观测退化，作用于环境返回的策略观测。"""
 
     def __init__(self, config_name: str, *, degradation_level: int | None = None):
-        if config_name != SELFPLAY_SCENARIO:
-            raise ValueError("本机状态退化仅支持 1v1/NoWeapon/Selfplay")
+        if config_name not in UNARMED_SELFPLAY_TASKS:
+            raise ValueError("本机状态退化仅支持无武器 Selfplay 和 TacticalHierarchySelfplay")
+        self._config_name = config_name
         self.degradation_level = degradation_level
         self._episode_level = 0
         self._degraders = {}
@@ -94,7 +100,7 @@ class SelfplayOwnshipDegradationEnv(SingleCombatEnv):
         super().__init__(config_name)
 
     def load_task(self):
-        validate_unarmed_selfplay(self.config)
+        validate_unarmed_selfplay(self.config, self._config_name)
         super().load_task()
 
     def seed(self, seed=None):
@@ -133,13 +139,14 @@ class SelfplayOwnshipDegradationEnv(SingleCombatEnv):
 
 
 class SelfplayJointDegradationEnv(SingleCombatEnv):
-    """普通无武器 1v1 的联合观测退化：前 9 维本机状态与后 6 维敌机火控雷达航迹同档同步退化。"""
+    """无武器 1v1 的联合观测退化，本机状态和敌机雷达航迹使用同一退化档位。"""
 
     def __init__(self, config_name: str, *, degradation_level: int | None = None):
-        if config_name != SELFPLAY_SCENARIO:
-            raise ValueError("联合观测退化仅支持 1v1/NoWeapon/Selfplay")
+        if config_name not in UNARMED_SELFPLAY_TASKS:
+            raise ValueError("联合观测退化仅支持无武器 Selfplay 和 TacticalHierarchySelfplay")
         if degradation_level is not None and not 0 <= degradation_level <= JOINT_DEGRADATION_MAX_LEVEL:
             raise ValueError(f"联合观测退化档位必须在 [0, {JOINT_DEGRADATION_MAX_LEVEL}] 范围内")
+        self._config_name = config_name
         self.degradation_level = degradation_level
         self._episode_level = 0
         self._ownship_degraders = {}
@@ -151,7 +158,7 @@ class SelfplayJointDegradationEnv(SingleCombatEnv):
         super().__init__(config_name)
 
     def load_task(self):
-        validate_unarmed_selfplay(self.config)
+        validate_unarmed_selfplay(self.config, self._config_name)
         super().load_task()
 
     def seed(self, seed=None):

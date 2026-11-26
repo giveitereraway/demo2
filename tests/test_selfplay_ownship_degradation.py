@@ -8,8 +8,10 @@ from envs.JSBSim.envs.selfplay_observation import (
     JOINT_DEGRADATION_MAX_LEVEL,
     JOINT_TRAIN_PROBABILITIES,
     OWN_SHIP_TRAIN_PROBABILITIES,
+    TACTICAL_SELFPLAY_SCENARIO,
     OwnshipObservationDegrader,
     SelfplayJointDegradationEnv,
+    SelfplayOwnshipDegradationEnv,
     validate_unarmed_selfplay,
 )
 from experiments.partial_observability_gru_eval import (
@@ -18,7 +20,7 @@ from experiments.partial_observability_gru_eval import (
     parse_cli_args,
     radar_conditions,
 )
-from scripts.train.train_jsbsim import parse_args as parse_train_args
+from scripts.train.train_jsbsim import make_eval_env, make_train_env, parse_args as parse_train_args
 
 
 def test_ownship_degradation_holds_and_delays_only_ownship_state():
@@ -140,3 +142,49 @@ def test_joint_degradation_env_step_perturbs_both_ownship_and_radar_obs():
         assert len(env._ownship_degraders) == 2
     finally:
         env.close()
+
+
+@pytest.mark.parametrize(("flag", "env_type", "has_radar"), [
+    ("--selfplay-ownship-degradation", SelfplayOwnshipDegradationEnv, False),
+    ("--selfplay-joint-degradation", SelfplayJointDegradationEnv, True),
+])
+def test_tactical_selfplay_ownship_degradation_stays_in_high_level_obs(flag, env_type, has_radar):
+    args = parse_train_args([
+        "--env-name", "SingleCombat", "--scenario-name", TACTICAL_SELFPLAY_SCENARIO,
+        "--use-selfplay", "--use-eval", "--n-rollout-threads", "1", "--n-eval-rollout-threads", "1",
+        "--policy-loss", "spo", "--memory-encoder", "igru", flag,
+    ], get_config())
+    train_env = make_train_env(args)
+    try:
+        assert isinstance(train_env.envs[0], env_type)
+        assert train_env.envs[0].degradation_level is None
+        assert train_env.reset().shape == (1, 2, 15)
+    finally:
+        train_env.close()
+
+    eval_env = make_eval_env(args)
+    env = eval_env.envs[0]
+    lowlevel_ownship = []
+    hook = env.task.lowlevel_policy.register_forward_pre_hook(
+        lambda _, inputs: lowlevel_ownship.append(inputs[0][0, 3:].copy())
+    )
+    try:
+        assert isinstance(env, env_type)
+        assert env.degradation_level == 2
+        obs = env.reset()
+        action = np.zeros((2, 1), dtype=np.int64)
+        ownship_changed = False
+        for _ in range(6):
+            task_obs = np.stack([env.task.get_obs(env, agent_id) for agent_id in env.agents])
+            np.testing.assert_array_equal(obs[:, 9:], task_obs[:, 9:])
+            ownship_changed |= not np.allclose(obs[:, :9], task_obs[:, :9])
+            lowlevel_ownship.clear()
+            obs, _, _, _ = env.step(action)
+            np.testing.assert_allclose(lowlevel_ownship, task_obs[:, :9], atol=1e-7)
+        assert ownship_changed
+        for agent_id in env.agents:
+            get_track = getattr(env, "get_enemy_radar_track", None)
+            assert (get_track is not None and get_track(agent_id) is not None) == has_radar
+    finally:
+        hook.remove()
+        eval_env.close()

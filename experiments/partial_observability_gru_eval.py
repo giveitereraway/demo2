@@ -20,7 +20,7 @@ import importlib.util
 import json
 import sys
 from collections import deque
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -55,7 +55,7 @@ ACTOR_B_SCENARIO_NAME = "1v1/NoWeapon/Selfplay"
 EVAL_SCENARIO_NAME = "1v1/NoWeapon/Selfplay"
 
 # 基本评估参数。
-NUM_EPISODES_PER_CONDITION = 50
+NUM_EPISODES_PER_CONDITION = 100
 ENV_SEED = 20260716
 SENSOR_SEED = 31001
 BOOTSTRAP_SEED = 41001
@@ -68,7 +68,8 @@ STRICT_WINNER = True                             # 超时双方存活时记为�
 INITIAL_STATE_MODE = "random"                    # fixed / random
 RANDOM_SIDE_SWAP = True                          # fixed 模式下随机交换初始阵位
 RANDOM_INITIAL_STATE_CONFIG = {
-    "distance_m": [18000.0, 22000.0],
+    # 默认无武器 Selfplay 训练的初始水平距离约为 5576 m，评估在其上下各 1000 m 均匀采样。
+    "distance_m": [4576.0, 6576.0],
     "center_north_m": [-1500.0, 1500.0],
     "center_east_m": [-1500.0, 1500.0],
     "altitude_ft": [16000.0, 26000.0],
@@ -223,14 +224,24 @@ def ownship_conditions(*, quick: bool) -> Tuple[ExperimentCondition, ...]:
 
 def radar_conditions(*, quick: bool) -> Tuple[ExperimentCondition, ...]:
     from envs.JSBSim.envs.selfplay_observation import JOINT_EVAL_LEVEL
-    from envs.JSBSim.envs.singlecombat_env import RADAR_DEGRADATION_SPECS
+    from envs.JSBSim.envs.singlecombat_env import RADAR_DEGRADATION_SPECS, RadarDegradationSpec
 
-    levels = (0, JOINT_EVAL_LEVEL) if quick else range(len(RADAR_DEGRADATION_SPECS))
+    # 丢帧率以整数百分比设档，噪声标准差按各自物理单位取整数。原 E4 作为评估的 E6。
+    eval_specs = (
+        RADAR_DEGRADATION_SPECS[0],
+        replace(RADAR_DEGRADATION_SPECS[1], azimuth_noise_std_deg=2),
+        RADAR_DEGRADATION_SPECS[2],
+        RadarDegradationSpec(0.30, 3, 300, 4, 80, 8),
+        RadarDegradationSpec(0.35, 4, 350, 5, 100, 10),
+        RadarDegradationSpec(0.45, 4, 450, 7, 130, 13),
+        RADAR_DEGRADATION_SPECS[4],
+    )
+    levels = (0, JOINT_EVAL_LEVEL) if quick else range(len(eval_specs))
     return tuple(
         ExperimentCondition(
             f"E{level}",
             "完整观测" if level == 0 else f"火控雷达航迹退化 E{level}",
-            RADAR_DEGRADATION_SPECS[level],
+            eval_specs[level],
             sensor_seed_group=int(level > 0),
             radar_level=level,
         )
@@ -600,12 +611,13 @@ def run_episode(
             )
         if condition.radar_level is not None:
             from envs.JSBSim.envs.singlecombat_env import (
-                RADAR_DEGRADATION_SPECS,
                 RadarTrackDegrader,
                 extract_true_enemy_track,
             )
 
-            radar_degrader = RadarTrackDegrader(RADAR_DEGRADATION_SPECS[condition.radar_level], radar_rng)
+            spec = condition.degradation
+            radar_spec = spec.radar if isinstance(spec, JointDegradationSpec) else spec
+            radar_degrader = RadarTrackDegrader(radar_spec, radar_rng)
             radar_degrader.reset(extract_true_enemy_track(env, agent_id))
             radar_degraders[actor_name] = radar_degrader
         elif condition.ownship_level is None and bool(getattr(controller, "is_tactical", False)):
@@ -1009,6 +1021,129 @@ def plot_episode_reward_curves(
     return [path]
 
 
+def episode_reward_series(rows: Sequence[Dict[str, Any]]) -> Dict[str, Tuple[np.ndarray, np.ndarray]]:
+    """按档位和实际局号整理奖励，接受运行中的记录和回读的 CSV 记录。"""
+    grouped: Dict[str, Dict[int, float]] = {}
+    for row in rows:
+        condition_id = str(row["condition_id"])
+        episode = int(row["episode"]) + 1
+        reward = float(row["actor_a_reward"])
+        condition = grouped.setdefault(condition_id, {})
+        if episode < 1 or episode in condition or not np.isfinite(reward):
+            raise ValueError(f"{condition_id} 第 {episode} 局的局号或奖励无效")
+        condition[episode] = reward
+    series = {}
+    for condition_id, condition in grouped.items():
+        episodes, rewards = zip(*sorted(condition.items()))
+        series[condition_id] = (np.asarray(episodes), np.asarray(rewards))
+    return series
+
+
+def plot_model_reward_comparison(
+    rows_by_model: Dict[str, List[Dict[str, Any]]],
+    baseline_rows: List[Dict[str, Any]] | None,
+    output_dir: Path,
+) -> Path | None:
+    """每个档位一张子图，所有子图共用干净 A 的 E0 奖励作为基线。"""
+    series_by_model = {name: episode_reward_series(rows) for name, rows in rows_by_model.items()}
+    reference = next(iter(series_by_model.values()), {})
+    if not reference:
+        raise ValueError("被测模型没有可绘制的单局奖励")
+    baseline = None if baseline_rows is None else episode_reward_series(baseline_rows).get("E0")
+    if baseline_rows is not None and baseline is None:
+        raise ValueError("干净 A 的结果缺少 E0 奖励")
+    for name, series in series_by_model.items():
+        if series.keys() != reference.keys():
+            raise ValueError(f"{name} 的观测退化档位与其他模型不一致")
+        for condition_id, (episodes, _) in series.items():
+            if not np.array_equal(episodes, reference[condition_id][0]):
+                raise ValueError(f"{name} 的 {condition_id} 局号与其他模型不一致")
+            if baseline is not None and not np.array_equal(episodes, baseline[0]):
+                raise ValueError(f"干净 A 的 E0 局号与 {condition_id} 不一致")
+
+    plt = load_pyplot()
+    if plt is None:
+        return None
+    ncols = min(len(reference), 3)
+    nrows = (len(reference) + ncols - 1) // ncols
+    figure, axes = plt.subplots(
+        nrows, ncols, figsize=(4.8 * ncols, 2.9 * nrows + 1.2),
+        sharex=True, sharey=True, squeeze=False,
+    )
+    colors = plt.get_cmap("tab10").colors
+    for axis, condition_id in zip(axes.flat, reference):
+        lines = []
+        if baseline is not None:
+            lines.append(("干净 A 基线（E0）", baseline, "#454545", "--"))
+        for index, (name, series) in enumerate(series_by_model.items()):
+            lines.append((name, series[condition_id], colors[index % len(colors)], "-"))
+        for name, (episodes, rewards), color, linestyle in lines:
+            axis.plot(episodes, rewards, color=color, alpha=0.22, linewidth=0.8)
+            smoothed = trailing_moving_average(rewards, REWARD_MOVING_AVERAGE_WINDOW)
+            axis.plot(episodes, smoothed, color=color, linestyle=linestyle, linewidth=1.8,
+                      marker="o" if episodes.size == 1 else None, label=name)
+        axis.set_title(condition_id)
+        axis.grid(alpha=0.22)
+        axis.tick_params(labelbottom=True)
+    for axis in list(axes.flat)[len(reference):]:
+        axis.set_visible(False)
+
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    min_episode = min(episodes[0] for episodes, _ in reference.values())
+    max_episode = max(episodes[-1] for episodes, _ in reference.values())
+    if min_episode == max_episode:
+        axes[0, 0].set_xticks([min_episode])
+    else:
+        axes[0, 0].set_xlim(min_episode, max_episode)
+    figure.suptitle("各观测退化档位的 Actor A 奖励对比", y=0.98)
+    figure.legend(handles, labels, loc="upper center", bbox_to_anchor=(0.5, 0.925), ncol=min(len(labels), 5))
+    figure.supxlabel(f"测试局数（细线为每局奖励，粗线为 {REWARD_MOVING_AVERAGE_WINDOW} 局滑动平均）")
+    figure.supylabel("单局累计奖励")
+    figure.tight_layout(rect=(0.025, 0.035, 1.0, 0.87))
+    path = output_dir / "plots" / "model_reward_curves_by_condition.png"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(path, dpi=PLOT_DPI, bbox_inches="tight")
+    plt.close(figure)
+    return path
+
+
+def load_reward_result(directory: Path) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    with (directory / "config.json").open(encoding="utf-8-sig") as file:
+        config = json.load(file)
+    # 归档结果可能从另一台机器复制，仓库内的权重用相对位置比较。
+    checkpoint = str(config["actor_b_path"]).replace("\\", "/")
+    _, separator, relative = checkpoint.partition("/scripts/results/")
+    config["actor_b_path"] = f"scripts/results/{relative}" if separator else checkpoint
+    with (directory / "all_episodes.csv").open(encoding="utf-8-sig", newline="") as file:
+        rows = list(csv.DictReader(file))
+    return config, rows
+
+
+def plot_saved_model_rewards(
+    results: Dict[str, Path], baseline_result: Path | None, output_dir: Path,
+) -> Path | None:
+    loaded = {name: load_reward_result(path) for name, path in results.items()}
+    reference = next(iter(loaded.values()))[0]
+    pairing_keys = (
+        "actor_b_path", "actor_b_scenario_name", "eval_scenario_name", "env_seed",
+        "deterministic", "swap_actor_order", "initial_state_mode", "random_initial_state_config",
+    )
+    comparison_keys = (*pairing_keys, "observation_mode", "degrade_both", "sensor_seed", "conditions")
+    for name, (config, _) in loaded.items():
+        mismatches = [key for key in comparison_keys if config[key] != reference[key]]
+        if mismatches:
+            raise ValueError(f"{name} 的评估配置与其他模型不同：{', '.join(mismatches)}")
+    baseline_rows = None
+    if baseline_result is not None:
+        baseline_config, baseline_rows = load_reward_result(baseline_result)
+        mismatches = [key for key in pairing_keys if baseline_config[key] != reference[key]]
+        if mismatches:
+            raise ValueError(f"干净 A 基线的评估配置与被测模型不同：{', '.join(mismatches)}")
+    return plot_model_reward_comparison(
+        {name: rows for name, (_, rows) in loaded.items()}, baseline_rows, output_dir,
+    )
+
+
 def config_snapshot(
     actor_a_path: Path, actor_b_path: Path, conditions: Sequence[ExperimentCondition]
 ) -> Dict[str, object]:
@@ -1040,7 +1175,17 @@ def config_snapshot(
 def parse_cli_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     """支持命令行覆盖路径、场景、局数和设备；无参数时沿用顶部配置。"""
     parser = argparse.ArgumentParser(description="普通无武器 Selfplay 的 E0–E6 观测退化评估")
-    parser.add_argument("--actor-a-path", type=Path, default=None, help="被测 Actor A 权重或目录")
+    inputs = parser.add_mutually_exclusive_group()
+    inputs.add_argument("--actor-a-path", type=Path, help="被测 Actor A 权重或目录")
+    inputs.add_argument("--model", action="append", nargs=2, metavar=("LABEL", "PATH"),
+                        help="增加一组被测 Actor A，可重复传入模型标签和权重路径")
+    inputs.add_argument("--compare-result", action="append", nargs=2, metavar=("LABEL", "DIR"),
+                        help="读取一组已有的评估结果出图，可重复传入标签和结果目录")
+    baseline = parser.add_mutually_exclusive_group()
+    baseline.add_argument("--baseline-actor-path", type=Path,
+                          help="配合 --model，在 E0 评估干净训练的 Actor A")
+    baseline.add_argument("--baseline-result", type=Path,
+                          help="配合 --compare-result，读取已有干净 Actor A 的 E0 奖励")
     parser.add_argument("--actor-b-path", type=Path, default=None, help="对手 Actor B 权重或目录")
     parser.add_argument("--actor-a-scenario", type=str, default=None, help="Actor A 训练场景名")
     parser.add_argument("--actor-b-scenario", type=str, default=None, help="Actor B 训练场景名")
@@ -1056,11 +1201,33 @@ def parse_cli_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                         help="仅运行 E0 与 E2 两档快验（适用于 ownship / radar / joint 模式）")
     parser.add_argument("--degrade-both", action="store_true",
                         help="红蓝双方同时施加同档观测退化，用于公平的跨实验 1v1 对抗评估")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.model and args.baseline_actor_path is None:
+        parser.error("--model 需要搭配 --baseline-actor-path")
+    if args.baseline_actor_path is not None and not args.model:
+        parser.error("--baseline-actor-path 需要搭配 --model")
+    if args.baseline_result is not None and not args.compare_result:
+        parser.error("--baseline-result 需要搭配 --compare-result")
+    named_inputs = args.model or args.compare_result or []
+    labels = [label for label, _ in named_inputs]
+    if len(set(labels)) != len(labels) or any(not label.strip() for label in labels):
+        parser.error("模型标签须非空且不能重复")
+    return args
 
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
     cli = parse_cli_args(argv)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = (cli.output_dir.resolve() if cli.output_dir is not None else OUTPUT_ROOT / f"run_{timestamp}")
+    if cli.compare_result:
+        plot_path = plot_saved_model_rewards(
+            {label: Path(directory) for label, directory in cli.compare_result},
+            cli.baseline_result, output_dir,
+        )
+        if plot_path is not None:
+            print(f"奖励对比图: {plot_path}")
+        return
+
     num_episodes = cli.episodes if cli.episodes is not None else NUM_EPISODES_PER_CONDITION
     actor_a_scenario = cli.actor_a_scenario or ACTOR_A_SCENARIO_NAME
     actor_b_scenario = cli.actor_b_scenario or ACTOR_B_SCENARIO_NAME
@@ -1075,7 +1242,11 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     validate_scenario_configs(
         (actor_a_scenario, actor_b_scenario, eval_scenario)
     )
-    actor_a_path = resolve_actor_path(cli.actor_a_path or ACTOR_A_PATH)
+    if cli.model:
+        candidate_paths = [(label, resolve_actor_path(path)) for label, path in cli.model]
+        baseline_path = resolve_actor_path(cli.baseline_actor_path)
+    else:
+        candidate_paths = [("Actor A", resolve_actor_path(cli.actor_a_path or ACTOR_A_PATH))]
     actor_b_path = resolve_actor_path(cli.actor_b_path or ACTOR_B_PATH)
 
     base = load_base_eval_module()
@@ -1117,38 +1288,71 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     base.torch.manual_seed(ENV_SEED)
     device = base.resolve_device(device_name)
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = (cli.output_dir.resolve() if cli.output_dir is not None else OUTPUT_ROOT / f"run_{timestamp}")
-    output_dir.mkdir(parents=True, exist_ok=True)
-    snapshot = config_snapshot(actor_a_path, actor_b_path, conditions)
-    snapshot.update({
-        "actor_a_scenario_name": actor_a_scenario,
-        "actor_b_scenario_name": actor_b_scenario,
-        "eval_scenario_name": eval_scenario,
-        "num_episodes_per_condition": num_episodes,
-        "device": str(device),
-        "observation_mode": observation_mode,
-        "degrade_both": bool(cli.degrade_both),
-    })
-    save_json(snapshot, output_dir / "config.json")
-
     needs_lowlevel = any("Hierarchy" in name for name in (actor_a_scenario, actor_b_scenario))
     lowlevel_policy = base.load_lowlevel_policy(device) if needs_lowlevel else None
-    actor_a = base.load_controller(
-        "actor_a", actor_a_path, actor_a_scenario, lowlevel_policy, device
-    )
     actor_b = base.load_controller(
         "actor_b", actor_b_path, actor_b_scenario, lowlevel_policy, device
     )
-    if (actor_a.is_hierarchical or actor_b.is_hierarchical) and lowlevel_policy is None:
-        lowlevel_policy = base.load_lowlevel_policy(device)
-        actor_a.lowlevel_policy = lowlevel_policy
-        actor_b.lowlevel_policy = lowlevel_policy
+
+    jobs = [
+        (label, path, conditions, output_dir / f"model_{index:02d}" if cli.model else output_dir)
+        for index, (label, path) in enumerate(candidate_paths, start=1)
+    ]
+    if cli.model:
+        jobs.append((None, baseline_path, conditions[:1], output_dir / "clean_baseline"))
+
+    rows_by_model = {}
+    baseline_rows = None
+    for label, actor_path, run_conditions, run_dir in jobs:
+        actor_a = base.load_controller("actor_a", actor_path, actor_a_scenario, lowlevel_policy, device)
+        if (actor_a.is_hierarchical or actor_b.is_hierarchical) and lowlevel_policy is None:
+            lowlevel_policy = base.load_lowlevel_policy(device)
+            actor_a.lowlevel_policy = lowlevel_policy
+            actor_b.lowlevel_policy = lowlevel_policy
+
+        snapshot = config_snapshot(actor_path, actor_b_path, run_conditions)
+        snapshot.update({
+            "actor_a_scenario_name": actor_a_scenario,
+            "actor_b_scenario_name": actor_b_scenario,
+            "eval_scenario_name": eval_scenario,
+            "num_episodes_per_condition": num_episodes,
+            "device": str(device),
+            "observation_mode": observation_mode,
+            "degrade_both": bool(cli.degrade_both),
+        })
+        if cli.model:
+            snapshot["model_label"] = label or "干净 A 基线（E0）"
+            print(f"\n===== {snapshot['model_label']} =====")
+        rows = evaluate_pair(base, actor_a, actor_b, run_conditions, run_dir, snapshot, quick_mode=quick_mode)
+        if label is None:
+            baseline_rows = rows
+        else:
+            rows_by_model[label] = rows
+
+    if cli.model:
+        plot_path = plot_model_reward_comparison(rows_by_model, baseline_rows, output_dir)
+        if plot_path is not None:
+            print(f"奖励对比图: {plot_path}")
+
+
+def evaluate_pair(
+    base: Any,
+    actor_a: Any,
+    actor_b: Any,
+    conditions: Sequence[ExperimentCondition],
+    output_dir: Path,
+    snapshot: Dict[str, Any],
+    *,
+    quick_mode: bool,
+) -> List[Dict[str, Any]]:
+    """评估一组 A/B，按原有目录结构保存逐局结果和汇总。"""
+    save_json(snapshot, output_dir / "config.json")
+    num_episodes = snapshot["num_episodes_per_condition"]
 
     print(f"输出目录: {output_dir}")
-    print(f"设备: {device}")
+    print(f"设备: {snapshot['device']}")
     print(f"每组回合数: {num_episodes}")
-    print(f"退化口径: {observation_mode} | 双方同退化: {bool(cli.degrade_both)}")
+    print(f"退化口径: {snapshot['observation_mode']} | 双方同退化: {snapshot['degrade_both']}")
 
     all_rows: List[Dict[str, object]] = []
     summaries: List[Dict[str, object]] = []
@@ -1156,7 +1360,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         print(f"\n===== {condition.condition_id}: {condition.label} =====")
         condition_dir = output_dir / condition.condition_id
         condition_dir.mkdir(parents=True, exist_ok=True)
-        env = base.SingleCombatEnv(eval_scenario)
+        env = base.SingleCombatEnv(snapshot["eval_scenario_name"])
         env.seed(ENV_SEED)
         try:
             base.validate_setup(env, [actor_a, actor_b])
@@ -1170,7 +1374,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                     actor_b,
                     condition_dir,
                     save_acmi=not quick_mode,
-                    degrade_both=bool(cli.degrade_both),
+                    degrade_both=snapshot["degrade_both"],
                 )
                 for episode in range(num_episodes)
             ]
@@ -1223,6 +1427,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     save_json(combined_summary, output_dir / "summary.json")
     print("\n===== 全部实验完成 =====")
     print(json.dumps(combined_summary, ensure_ascii=False, indent=2))
+    return all_rows
 
 
 if __name__ == "__main__":

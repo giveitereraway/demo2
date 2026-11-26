@@ -159,9 +159,10 @@ class Command:
     delta_velocity_mps: float
 
 
+FixedSequence = tuple[tuple[str, Command], ...]
 FIXED_SEQUENCE_STAGE_SEC = 30.0
 # 指令偏移统一相对同一回合的初始状态。
-FIXED_SEQUENCE = (
+FIXED_SEQUENCE: FixedSequence = (
     ("level_hold", Command(0.0, 0.0, 0.0)),
     ("turn_and_climb", Command(100.0, 15.0, 0.0)),
     ("reverse_turn_and_slow", Command(100.0, -15.0, -17.0)),
@@ -410,38 +411,41 @@ def read_command_target(env: SingleControlEnv) -> dict[str, float]:
     }
 
 
-def fixed_sequence_horizon_steps(env: SingleControlEnv) -> int:
+def fixed_sequence_horizon_steps(env: SingleControlEnv, sequence: FixedSequence = FIXED_SEQUENCE) -> int:
     stage_steps = math.ceil(FIXED_SEQUENCE_STAGE_SEC / env.time_interval)
-    horizon_steps = stage_steps * len(FIXED_SEQUENCE)
+    horizon_steps = stage_steps * len(sequence)
     if horizon_steps > env.config.max_steps:
         raise ValueError(f"场景最多允许 {env.config.max_steps} 步，固定序列需要 {horizon_steps} 步")
     return horizon_steps
 
 
-def fixed_sequence_config(horizon_steps: int, time_interval: float) -> dict[str, Any]:
-    stage_steps = horizon_steps // len(FIXED_SEQUENCE)
+def fixed_sequence_config(
+    horizon_steps: int, time_interval: float, sequence: FixedSequence = FIXED_SEQUENCE,
+) -> dict[str, Any]:
+    stage_steps = horizon_steps // len(sequence)
     return {
         "target_reference": "episode_initial_state",
         "stage_duration_sec": stage_steps * time_interval,
         "stage_steps": stage_steps,
         "stages": [
             {"name": name, "start_sec": idx * stage_steps * time_interval, **asdict(command)}
-            for idx, (name, command) in enumerate(FIXED_SEQUENCE)
+            for idx, (name, command) in enumerate(sequence)
         ],
     }
 
 
 def iter_command_stages(
-    env: SingleControlEnv, command: Command | None, horizon_steps: int
+    env: SingleControlEnv, command: Command | None, horizon_steps: int,
+    *, fixed_sequence: FixedSequence = FIXED_SEQUENCE,
 ) -> Iterator[CommandStage]:
     """逐段下发目标；command 为空时使用固定序列。"""
     if command is not None:
         yield CommandStage(None, command, set_command_target(env, command), 0, horizon_steps)
         return
 
-    stage_steps = horizon_steps // len(FIXED_SEQUENCE)
+    stage_steps = horizon_steps // len(fixed_sequence)
     reference = None
-    for idx, (name, stage_command) in enumerate(FIXED_SEQUENCE):
+    for idx, (name, stage_command) in enumerate(fixed_sequence):
         target_info = set_command_target(env, stage_command, reference)
         if reference is None:
             reference = target_info

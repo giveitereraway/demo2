@@ -17,7 +17,6 @@ variant="${1:-ppo-attention}"
 observation="${2:-clean}"
 seed="${SEED:-1}"
 num_env_steps="${NUM_ENV_STEPS:-1e8}"
-default_opponents=1
 
 case "$variant" in
     ppo-mlp)
@@ -76,7 +75,6 @@ case "$observation" in
         set -- "$@" --combat-radar-degradation
         ;;
     joint)
-        default_opponents=4
         exp="1v1_${variant}_joint_${num_env_steps}"
         set -- "$@" --selfplay-joint-degradation
         ;;
@@ -86,7 +84,7 @@ case "$observation" in
         ;;
 esac
 
-n_choose_opponents="${N_CHOOSE_OPPONENTS:-$default_opponents}"
+n_choose_opponents="${N_CHOOSE_OPPONENTS:-4}"
 exp="${EXP_NAME:-$exp}"
 
 echo "env=${env}, scenario=${scenario}, algo=${algo}, policy_loss=${policy_loss}, exp=${exp}, seed=${seed}, obs=${observation}, opponents=${n_choose_opponents}"
